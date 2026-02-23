@@ -21,6 +21,32 @@ pub fn list_applications() -> Result<Vec<String>, Box<dyn Error>> {
     Ok(apps)
 }
 
+/// 获取当前正在运行的应用程序列表。
+pub fn list_running_applications() -> Result<Vec<String>, Box<dyn Error>> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(
+            "tell application \"System Events\" to get name of every process whose background only is false",
+        )
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("获取运行中应用失败: {}", stderr.trim()).into());
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let apps = stdout
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    Ok(apps)
+}
+
 /// 打开指定的应用程序。
 pub fn open_application(app_name: &str) -> Result<(), Box<dyn Error>> {
     let status = Command::new("open").arg("-a").arg(app_name).status()?;

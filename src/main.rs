@@ -1,4 +1,5 @@
 mod app_manager;
+mod accessibility;
 mod keyboard;
 mod mcp_server;
 

@@ -7,6 +7,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::accessibility;
 use crate::app_manager;
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,16 @@ impl AppManagerServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    #[tool(name = "list_running_apps", description = "列出当前正在运行的应用程序")]
+    fn list_running_apps(&self) -> Result<CallToolResult, McpError> {
+        let apps = app_manager::list_running_applications()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let text = serde_json::to_string(&apps)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
     #[tool(name = "open_app", description = "打开指定应用程序")]
     fn open_app(
         &self,
@@ -70,13 +81,27 @@ impl AppManagerServer {
             app_name
         ))]))
     }
+
+    #[tool(name = "get_ui_tree", description = "获取指定应用的 UI 元素树")]
+    fn get_ui_tree(
+        &self,
+        Parameters(AppNameRequest { app_name }): Parameters<AppNameRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let ui_tree = accessibility::get_ui_tree(&app_name)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(ui_tree)]))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for AppManagerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("应用程序管理 MCP server，提供 list_apps/open_app/close_app 工具".into()),
+            instructions: Some(
+                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/get_ui_tree 工具"
+                    .into(),
+            ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
