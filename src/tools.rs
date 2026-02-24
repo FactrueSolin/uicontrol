@@ -4,7 +4,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use thiserror::Error;
+
+use crate::display::StitchedLayout;
 
 #[derive(Debug, Error)]
 #[error("工具执行失败: {0}")]
@@ -12,11 +15,13 @@ pub struct ToolError(pub String);
 
 #[derive(Debug, Deserialize)]
 pub struct ClickArgs {
-    pub x: i32,
-    pub y: i32,
+    pub x: f64,
+    pub y: f64,
 }
 
-pub struct ClickTool;
+pub struct ClickTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
 
 impl Tool for ClickTool {
     const NAME: &'static str = "click";
@@ -31,8 +36,8 @@ impl Tool for ClickTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer", "description": "屏幕 X 坐标" },
-                    "y": { "type": "integer", "description": "屏幕 Y 坐标" }
+                    "x": { "type": "number", "description": "归一化 X 坐标，范围 [0,999]" },
+                    "y": { "type": "number", "description": "归一化 Y 坐标，范围 [0,999]" }
                 },
                 "required": ["x", "y"]
             }),
@@ -40,9 +45,13 @@ impl Tool for ClickTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("[工具调用] click | 输入: x={}, y={}", args.x, args.y);
-        crate::mouse::click(args.x, args.y).map_err(ToolError)?;
-        let output = format!("已点击坐标 ({}, {})", args.x, args.y);
+        println!("[工具调用] click | 输入: norm_x={}, norm_y={}", args.x, args.y);
+        let (x, y) = map_norm_to_global(&self.layout, args.x, args.y)?;
+        crate::mouse::click(x, y).map_err(ToolError)?;
+        let output = format!(
+            "已点击归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {})",
+            args.x, args.y, x, y
+        );
         println!("[工具结果] click | 输出: {}", output);
         Ok(output)
     }
@@ -50,11 +59,13 @@ impl Tool for ClickTool {
 
 #[derive(Debug, Deserialize)]
 pub struct RightClickArgs {
-    pub x: i32,
-    pub y: i32,
+    pub x: f64,
+    pub y: f64,
 }
 
-pub struct RightClickTool;
+pub struct RightClickTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
 
 impl Tool for RightClickTool {
     const NAME: &'static str = "right_click";
@@ -69,8 +80,8 @@ impl Tool for RightClickTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer", "description": "屏幕 X 坐标" },
-                    "y": { "type": "integer", "description": "屏幕 Y 坐标" }
+                    "x": { "type": "number", "description": "归一化 X 坐标，范围 [0,999]" },
+                    "y": { "type": "number", "description": "归一化 Y 坐标，范围 [0,999]" }
                 },
                 "required": ["x", "y"]
             }),
@@ -78,9 +89,13 @@ impl Tool for RightClickTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("[工具调用] right_click | 输入: x={}, y={}", args.x, args.y);
-        crate::mouse::right_click(args.x, args.y).map_err(ToolError)?;
-        let output = format!("已右键点击坐标 ({}, {})", args.x, args.y);
+        println!("[工具调用] right_click | 输入: norm_x={}, norm_y={}", args.x, args.y);
+        let (x, y) = map_norm_to_global(&self.layout, args.x, args.y)?;
+        crate::mouse::right_click(x, y).map_err(ToolError)?;
+        let output = format!(
+            "已右键点击归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {})",
+            args.x, args.y, x, y
+        );
         println!("[工具结果] right_click | 输出: {}", output);
         Ok(output)
     }
@@ -88,11 +103,13 @@ impl Tool for RightClickTool {
 
 #[derive(Debug, Deserialize)]
 pub struct DoubleClickArgs {
-    pub x: i32,
-    pub y: i32,
+    pub x: f64,
+    pub y: f64,
 }
 
-pub struct DoubleClickTool;
+pub struct DoubleClickTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
 
 impl Tool for DoubleClickTool {
     const NAME: &'static str = "double_click";
@@ -107,8 +124,8 @@ impl Tool for DoubleClickTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer", "description": "屏幕 X 坐标" },
-                    "y": { "type": "integer", "description": "屏幕 Y 坐标" }
+                    "x": { "type": "number", "description": "归一化 X 坐标，范围 [0,999]" },
+                    "y": { "type": "number", "description": "归一化 Y 坐标，范围 [0,999]" }
                 },
                 "required": ["x", "y"]
             }),
@@ -116,10 +133,59 @@ impl Tool for DoubleClickTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("[工具调用] double_click | 输入: x={}, y={}", args.x, args.y);
-        crate::mouse::double_click(args.x, args.y).map_err(ToolError)?;
-        let output = format!("已双击坐标 ({}, {})", args.x, args.y);
+        println!("[工具调用] double_click | 输入: norm_x={}, norm_y={}", args.x, args.y);
+        let (x, y) = map_norm_to_global(&self.layout, args.x, args.y)?;
+        crate::mouse::double_click(x, y).map_err(ToolError)?;
+        let output = format!(
+            "已双击归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {})",
+            args.x, args.y, x, y
+        );
         println!("[工具结果] double_click | 输出: {}", output);
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HoverArgs {
+    pub x: f64,
+    pub y: f64,
+}
+
+pub struct HoverTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
+
+impl Tool for HoverTool {
+    const NAME: &'static str = "hover";
+    type Error = ToolError;
+    type Args = HoverArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "将鼠标移动到屏幕指定坐标，不点击。用于触发悬停菜单、显示工具提示或激活 hover 效果"
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "目标位置归一化 X 坐标，范围 [0,999]" },
+                    "y": { "type": "number", "description": "目标位置归一化 Y 坐标，范围 [0,999]" }
+                },
+                "required": ["x", "y"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!("[工具调用] hover | 输入：norm_x={}, norm_y={}", args.x, args.y);
+        let (x, y) = map_norm_to_global(&self.layout, args.x, args.y)?;
+        crate::mouse::hover(x, y).map_err(|e| ToolError(e.to_string()))?;
+        let output = format!(
+            "已将鼠标移动到归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {})",
+            args.x, args.y, x, y
+        );
+        println!("[工具结果] hover | 输出：{}", output);
         Ok(output)
     }
 }
@@ -248,13 +314,15 @@ impl Tool for HotkeyTool {
 
 #[derive(Debug, Deserialize)]
 pub struct ScrollArgs {
-    pub x: i32,
-    pub y: i32,
+    pub x: f64,
+    pub y: f64,
     pub direction: String,
     pub clicks: i32,
 }
 
-pub struct ScrollTool;
+pub struct ScrollTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
 
 impl Tool for ScrollTool {
     const NAME: &'static str = "scroll";
@@ -269,8 +337,8 @@ impl Tool for ScrollTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer", "description": "屏幕 X 坐标" },
-                    "y": { "type": "integer", "description": "屏幕 Y 坐标" },
+                    "x": { "type": "number", "description": "归一化 X 坐标，范围 [0,999]" },
+                    "y": { "type": "number", "description": "归一化 Y 坐标，范围 [0,999]" },
                     "direction": { "type": "string", "description": "滚动方向（up/down）" },
                     "clicks": { "type": "integer", "description": "滚动格数" }
                 },
@@ -280,14 +348,15 @@ impl Tool for ScrollTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let (x, y) = map_norm_to_global(&self.layout, args.x, args.y)?;
         println!(
-            "[工具调用] scroll | 输入: x={}, y={}, direction=\"{}\", clicks={}",
+            "[工具调用] scroll | 输入: norm_x={}, norm_y={}, direction=\"{}\", clicks={}",
             args.x, args.y, args.direction, args.clicks
         );
-        crate::mouse::scroll(args.x, args.y, &args.direction, args.clicks).map_err(ToolError)?;
+        crate::mouse::scroll(x, y, &args.direction, args.clicks).map_err(ToolError)?;
         let output = format!(
-            "已在 ({}, {}) 向 {} 滚动 {} 格",
-            args.x, args.y, args.direction, args.clicks
+            "已在归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {}) 向 {} 滚动 {} 格",
+            args.x, args.y, x, y, args.direction, args.clicks
         );
         println!("[工具结果] scroll | 输出: {}", output);
         Ok(output)
@@ -296,13 +365,15 @@ impl Tool for ScrollTool {
 
 #[derive(Debug, Deserialize)]
 pub struct DragArgs {
-    pub from_x: i32,
-    pub from_y: i32,
-    pub to_x: i32,
-    pub to_y: i32,
+    pub from_x: f64,
+    pub from_y: f64,
+    pub to_x: f64,
+    pub to_y: f64,
 }
 
-pub struct DragTool;
+pub struct DragTool {
+    pub layout: Arc<Mutex<StitchedLayout>>,
+}
 
 impl Tool for DragTool {
     const NAME: &'static str = "drag";
@@ -317,10 +388,10 @@ impl Tool for DragTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "from_x": { "type": "integer", "description": "起点 X 坐标" },
-                    "from_y": { "type": "integer", "description": "起点 Y 坐标" },
-                    "to_x": { "type": "integer", "description": "终点 X 坐标" },
-                    "to_y": { "type": "integer", "description": "终点 Y 坐标" }
+                    "from_x": { "type": "number", "description": "起点归一化 X 坐标，范围 [0,999]" },
+                    "from_y": { "type": "number", "description": "起点归一化 Y 坐标，范围 [0,999]" },
+                    "to_x": { "type": "number", "description": "终点归一化 X 坐标，范围 [0,999]" },
+                    "to_y": { "type": "number", "description": "终点归一化 Y 坐标，范围 [0,999]" }
                 },
                 "required": ["from_x", "from_y", "to_x", "to_y"]
             }),
@@ -328,18 +399,33 @@ impl Tool for DragTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let (from_x, from_y) = map_norm_to_global(&self.layout, args.from_x, args.from_y)?;
+        let (to_x, to_y) = map_norm_to_global(&self.layout, args.to_x, args.to_y)?;
         println!(
-            "[工具调用] drag | 输入: from=({},{}), to=({},{})",
+            "[工具调用] drag | 输入: from_norm=({:.2},{:.2}), to_norm=({:.2},{:.2})",
             args.from_x, args.from_y, args.to_x, args.to_y
         );
-        crate::mouse::drag(args.from_x, args.from_y, args.to_x, args.to_y).map_err(ToolError)?;
+        crate::mouse::drag(from_x, from_y, to_x, to_y).map_err(ToolError)?;
         let output = format!(
-            "已拖拽: ({}, {}) -> ({}, {})",
-            args.from_x, args.from_y, args.to_x, args.to_y
+            "已拖拽: 归一化 ({:.2}, {:.2}) -> ({:.2}, {:.2}), 全局 ({}, {}) -> ({}, {})",
+            args.from_x, args.from_y, args.to_x, args.to_y, from_x, from_y, to_x, to_y
         );
         println!("[工具结果] drag | 输出: {}", output);
         Ok(output)
     }
+}
+
+fn map_norm_to_global(
+    layout: &Arc<Mutex<StitchedLayout>>,
+    norm_x: f64,
+    norm_y: f64,
+) -> Result<(i32, i32), ToolError> {
+    let guard = layout
+        .lock()
+        .map_err(|e| ToolError(format!("布局锁获取失败: {}", e)))?;
+    guard
+        .normalized_to_global(norm_x, norm_y)
+        .map_err(ToolError)
 }
 
 #[derive(Debug, Deserialize)]
