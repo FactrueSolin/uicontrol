@@ -1,6 +1,7 @@
 pub mod accessibility;
 pub mod ai;
 pub mod app_manager;
+pub mod document_parser;
 pub mod keyboard;
 pub mod mcp_server;
 pub mod mouse;

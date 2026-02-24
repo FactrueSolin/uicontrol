@@ -5,7 +5,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::accessibility;
+// use crate::accessibility;
 use crate::app_manager;
 // use crate::screenshot;
 
@@ -86,16 +86,16 @@ impl AppManagerServer {
         ))]))
     }
 
-    #[tool(name = "get_ui_tree", description = "获取指定应用的 UI 元素树")]
-    fn get_ui_tree(
-        &self,
-        Parameters(AppNameRequest { app_name }): Parameters<AppNameRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let ui_tree = accessibility::get_ui_tree(&app_name)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    // #[tool(name = "get_ui_tree", description = "获取指定应用的 UI 元素树")]
+    // fn get_ui_tree(
+    //     &self,
+    //     Parameters(AppNameRequest { app_name }): Parameters<AppNameRequest>,
+    // ) -> Result<CallToolResult, McpError> {
+    //     let ui_tree = accessibility::get_ui_tree(&app_name)
+    //         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(ui_tree)]))
-    }
+    //     Ok(CallToolResult::success(vec![Content::text(ui_tree)]))
+    // }
 
     #[tool(name = "focus_app", description = "切换焦点至指定应用程序（将应用带到前台）")]
     fn focus_app(
@@ -139,7 +139,7 @@ impl ServerHandler for AppManagerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/focus_app/get_ui_tree/take_screenshot 工具"
+                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/focus_app/take_screenshot 工具"
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

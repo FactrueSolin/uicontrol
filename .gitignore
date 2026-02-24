@@ -4,3 +4,4 @@
 rmcp-example
 
 *.env
+/testdata
