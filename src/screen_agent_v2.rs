@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::io::Write;
 
 use crate::ai::load_openai_config;
 use crate::display::{get_stitched_layout, StitchedLayout};
@@ -97,6 +98,59 @@ struct Usage {
     total_tokens: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCall {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    call_type: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 pub struct ScreenAgentV2;
 
 impl ScreenAgentV2 {
@@ -148,7 +202,8 @@ impl ScreenAgentV2 {
                     "messages": messages,
                     "tools": tools,
                     "enable_thinking": true,
-                    "thinking_budget": -1
+                    "thinking_budget": -1,
+                    "stream": true
                 });
 
                 println!("📤 发送请求...");
@@ -162,43 +217,130 @@ impl ScreenAgentV2 {
                     .context("请求 OpenAI 兼容接口失败")?;
 
                 let status = response.status();
-                let body = response.text().await.context("读取响应体失败")?;
 
                 if !status.is_success() {
+                    let body = response.text().await.context("读取响应体失败")?;
                     println!("❌ API 错误 ({}): {}", status, body);
                     final_result = format!("API 错误 ({}): {}", status, body);
                     break;
                 }
 
-                let chat_response: ChatResponse =
-                    serde_json::from_str(&body).with_context(|| format!("响应 JSON 解析失败: {}", body))?;
+                let mut sse_buffer = String::new();
+                let mut stream_done = false;
+                let mut full_content = String::new();
+                let mut full_reasoning = String::new();
+                let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
+                let mut usage: Option<Usage> = None;
+                let mut finish_reason: Option<String> = None;
+                let mut reasoning_printed = false;
+                let mut content_printed = false;
 
-                if let Some(usage) = &chat_response.usage {
+                let mut response = response;
+                while let Some(chunk) = response.chunk().await.context("读取流式响应失败")? {
+                    let chunk_text = String::from_utf8_lossy(&chunk);
+                    sse_buffer.push_str(&chunk_text);
+
+                    while let Some(newline_pos) = sse_buffer.find('\n') {
+                        let raw_line = sse_buffer[..newline_pos].trim_end_matches('\r').to_string();
+                        sse_buffer.drain(..=newline_pos);
+
+                        let line = raw_line.trim();
+                        if line.is_empty() || !line.starts_with("data: ") {
+                            continue;
+                        }
+
+                        let data = &line[6..];
+                        if data == "[DONE]" {
+                            stream_done = true;
+                            break;
+                        }
+
+                        let stream_chunk: StreamChunk = serde_json::from_str(data)
+                            .with_context(|| format!("流式 chunk JSON 解析失败: {}", data))?;
+
+                        if stream_chunk.usage.is_some() {
+                            usage = stream_chunk.usage;
+                        }
+
+                        for choice in stream_chunk.choices {
+                            if let Some(fr) = choice.finish_reason {
+                                finish_reason = Some(fr);
+                            }
+
+                            let delta = choice.delta;
+                            let _ = &delta.role;
+
+                            if let Some(reasoning) = delta.reasoning_content {
+                                if !reasoning_printed {
+                                    print!("💭 ");
+                                    reasoning_printed = true;
+                                }
+                                print!("{}", reasoning);
+                                std::io::stdout().flush().ok();
+                                full_reasoning.push_str(&reasoning);
+                            }
+
+                            if let Some(content) = delta.content {
+                                if !content_printed {
+                                    println!("📥 [第 {} 轮] AI 的输出：", round);
+                                    content_printed = true;
+                                }
+                                print!("{}", content);
+                                std::io::stdout().flush().ok();
+                                full_content.push_str(&content);
+                            }
+
+                            if let Some(tool_calls) = delta.tool_calls {
+                                for tc in tool_calls {
+                                    merge_stream_tool_call(&mut pending_tool_calls, tc);
+                                }
+                            }
+                        }
+                    }
+
+                    if stream_done {
+                        break;
+                    }
+                }
+
+                if reasoning_printed {
+                    println!();
+                }
+                if content_printed {
+                    println!();
+                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                }
+
+                if let Some(usage) = &usage {
                     println!(
                         "📊 Token 用量：prompt={}, completion={}, total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     );
                 }
 
-                let choice = chat_response
-                    .choices
-                    .first()
-                    .ok_or_else(|| anyhow!("响应中不存在 choices[0]"))?;
-                let message = &choice.message;
-
-                if let Some(reasoning) = &message.reasoning_content {
-                    let preview: String = reasoning.chars().take(200).collect();
-                    let suffix = if reasoning.chars().count() > 200 { "..." } else { "" };
-                    println!("💭 思考过程：{}{}", preview, suffix);
-                }
-                if let Some(content) = &message.content {
-                    println!("📥 [第 {} 轮] AI 的输出：", round);
-                    println!("{}", content);
-                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                }
-                if let Some(finish_reason) = &choice.finish_reason {
+                if let Some(finish_reason) = &finish_reason {
                     println!("🏁 finish_reason: {}", finish_reason);
                 }
+
+                let tool_calls = finalize_stream_tool_calls(pending_tool_calls);
+                if !tool_calls.is_empty() {
+                    for tc in &tool_calls {
+                        println!(
+                            "🧰 tool_call: id={}, type={}, name={}, arguments={}",
+                            tc.id, tc.call_type, tc.function.name, tc.function.arguments
+                        );
+                    }
+                }
+
+                let message = AssistantMessage {
+                    content: if full_content.is_empty() { None } else { Some(full_content) },
+                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    reasoning_content: if full_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(full_reasoning)
+                    },
+                };
 
                 if let Some(tool_calls) = &message.tool_calls {
                     let assistant_content = message
@@ -549,4 +691,52 @@ fn prune_old_image_messages(messages: &mut [Value]) {
             content.retain(|item| item.get("type").and_then(Value::as_str) != Some("image_url"));
         }
     }
+}
+
+fn merge_stream_tool_call(pending: &mut Vec<PendingToolCall>, tc: StreamToolCall) {
+    if pending.len() <= tc.index {
+        pending.resize_with(tc.index + 1, PendingToolCall::default);
+    }
+
+    let target = &mut pending[tc.index];
+
+    if let Some(id) = tc.id {
+        target.id = Some(id);
+    }
+    if let Some(call_type) = tc.r#type {
+        target.call_type = Some(call_type);
+    }
+    if let Some(function) = tc.function {
+        if let Some(name) = function.name {
+            target.name = Some(name);
+        }
+        if let Some(arguments) = function.arguments {
+            target.arguments.push_str(&arguments);
+        }
+    }
+}
+
+fn finalize_stream_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
+    pending
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, tc)| {
+            let has_any_data = tc.id.is_some()
+                || tc.call_type.is_some()
+                || tc.name.is_some()
+                || !tc.arguments.is_empty();
+            if !has_any_data {
+                return None;
+            }
+
+            Some(ToolCall {
+                id: tc.id.unwrap_or_else(|| format!("stream_call_{}", idx)),
+                call_type: tc.call_type.unwrap_or_else(|| "function".to_string()),
+                function: FunctionCall {
+                    name: tc.name.unwrap_or_default(),
+                    arguments: tc.arguments,
+                },
+            })
+        })
+        .collect()
 }
