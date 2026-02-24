@@ -1,14 +1,9 @@
-mod app_manager;
-mod accessibility;
-mod keyboard;
-mod mcp_server;
-
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use mcp_server::AppManagerServer;
+use uicontrol::mcp_server::AppManagerServer;
 
 const BIND_ADDRESS: &str = "127.0.0.1:8000";
 

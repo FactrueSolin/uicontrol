@@ -206,19 +206,33 @@ fn build_ui_node(element: &AXUIElement, depth: usize) -> UiNode {
     let value = element.value().ok().and_then(cf_type_to_json);
     let position = get_position(element);
 
-    let children = if depth >= MAX_DEPTH {
+    eprintln!(
+        "[get_ui_tree] depth={} role={}",
+        depth,
+        role.as_deref().unwrap_or("<unknown>")
+    );
+
+    let ax_children: Vec<AXUIElement> = if depth >= MAX_DEPTH {
         Vec::new()
     } else {
         element
             .children()
             .ok()
-            .map(|arr| {
-                arr.into_iter()
-                    .map(|child| build_ui_node(&child, depth + 1))
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.into_iter().map(|item| (*item).clone()).collect())
             .unwrap_or_default()
     };
+
+    eprintln!(
+        "[get_ui_tree] depth={} role={} AXChildren={}",
+        depth,
+        role.as_deref().unwrap_or("<unknown>"),
+        ax_children.len()
+    );
+
+    let children = ax_children
+        .into_iter()
+        .map(|child| build_ui_node(&child, depth + 1))
+        .collect::<Vec<_>>();
 
     UiNode {
         role,
@@ -229,6 +243,47 @@ fn build_ui_node(element: &AXUIElement, depth: usize) -> UiNode {
     }
 }
 
+fn collect_app_top_level_elements(app_element: &AXUIElement) -> Vec<AXUIElement> {
+    let mut children: Vec<AXUIElement> = app_element
+        .children()
+        .ok()
+        .map(|arr| arr.into_iter().map(|item| (*item).clone()).collect())
+        .unwrap_or_default();
+    let windows: Vec<AXUIElement> = app_element
+        .windows()
+        .ok()
+        .map(|arr| arr.into_iter().map(|item| (*item).clone()).collect())
+        .unwrap_or_default();
+
+    eprintln!(
+        "[get_ui_tree] app AXChildren={}, AXWindows={}",
+        children.len(),
+        windows.len()
+    );
+
+    let has_window_in_children = children.iter().any(|child| {
+        child
+            .role()
+            .ok()
+            .map(|s| s.to_string())
+            .as_deref()
+            == Some("AXWindow")
+    });
+
+    if !has_window_in_children && !windows.is_empty() {
+        eprintln!(
+            "[get_ui_tree] AXChildren 中未发现 AXWindow，追加 AXWindows 进行遍历"
+        );
+        children.extend(windows);
+    }
+
+    if children.is_empty() {
+        eprintln!("[get_ui_tree] 未获取到任何顶层元素");
+    }
+
+    children
+}
+
 /// 获取指定应用的 UI 元素树
 pub fn get_ui_tree(app_name: &str) -> Result<String, Box<dyn Error>> {
     ensure_accessibility_permission()?;
@@ -236,12 +291,10 @@ pub fn get_ui_tree(app_name: &str) -> Result<String, Box<dyn Error>> {
     let pid = find_process_pid(app_name)?;
     let app_element = AXUIElement::application(pid);
 
-    let top_level = app_element
-        .windows()
-        .ok()
-        .filter(|windows| !windows.is_empty())
-        .or_else(|| app_element.children().ok())
-        .ok_or_else(|| "无法读取应用 UI 树（可能是权限不足或应用不支持 AX）".to_string())?;
+    let top_level = collect_app_top_level_elements(&app_element);
+    if top_level.is_empty() {
+        return Err("无法读取应用 UI 树（可能是权限不足或应用不支持 AX）".into());
+    }
 
     let nodes: Vec<UiNode> = top_level
         .into_iter()

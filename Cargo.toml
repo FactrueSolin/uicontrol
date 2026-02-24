@@ -9,8 +9,11 @@ anyhow = "1"
 axum = "0.7"
 accessibility = "0.1"
 accessibility-sys = "0.1"
+base64 = "0.22"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
+dotenv = "0.15"
+rig-core = "0.31"
 rmcp = { version = "0.14.0", features = ["server", "transport-streamable-http-server"] }
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }

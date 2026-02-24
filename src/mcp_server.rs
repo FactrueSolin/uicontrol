@@ -1,14 +1,13 @@
 use rmcp::{
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ErrorData as McpError, ServerCapabilities, ServerInfo},
-    schemars,
-    tool, tool_handler, tool_router,
+    model::{CallToolResult, Content, ErrorData as McpError, Role, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
 
 use crate::accessibility;
 use crate::app_manager;
+// use crate::screenshot;
 
 #[derive(Debug, Clone)]
 pub struct AppManagerServer {
@@ -19,6 +18,11 @@ pub struct AppManagerServer {
 struct AppNameRequest {
     app_name: String,
 }
+
+// #[derive(Debug, Deserialize, schemars::JsonSchema)]
+// struct ScreenshotRequest {
+//     display_id: Option<u32>,
+// }
 
 impl Default for AppManagerServer {
     fn default() -> Self {
@@ -92,6 +96,28 @@ impl AppManagerServer {
 
         Ok(CallToolResult::success(vec![Content::text(ui_tree)]))
     }
+
+    // #[tool(
+    //     name = "take_screenshot",
+    //     description = "截图工具：可指定 display_id 截图单屏，不传则截图所有屏幕"
+    // )]
+    // fn take_screenshot(
+    //     &self,
+    //     Parameters(ScreenshotRequest { display_id }): Parameters<ScreenshotRequest>,
+    // ) -> Result<CallToolResult, McpError> {
+    //     let shots = screenshot::take_screenshot(display_id)
+    //         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+    //     let mut contents = Vec::with_capacity(shots.len() * 2);
+    //     for shot in shots {
+    //         contents.push(Content::text(shot.description.clone()));
+    //         contents.push(
+    //             Content::image(shot.image_base64, "image/png").with_audience(vec![Role::Assistant]),
+    //         );
+    //     }
+
+    //     Ok(CallToolResult::success(contents))
+    // }
 }
 
 #[tool_handler]
@@ -99,7 +125,7 @@ impl ServerHandler for AppManagerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/get_ui_tree 工具"
+                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/get_ui_tree/take_screenshot 工具"
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
