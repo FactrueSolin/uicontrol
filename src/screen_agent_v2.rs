@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
+use tokio::time::Duration;
 
 use crate::ai::load_openai_config;
 use crate::display::{get_stitched_layout, StitchedLayout};
@@ -37,15 +38,14 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 - open_application(app_name) - 打开应用
 - close_application(app_name) - 关闭应用
 - focus_application(app_name) - 聚焦应用到前台
-- list_applications() - 列出已安装应用
-- list_running_applications() - 列出运行中应用
 
 ### 任务控制
+- wait(seconds) - 等待指定秒数，用于等待页面加载、动画完成等场景
 - task_complete(summary) - 任务完成时调用，summary 为完成摘要
 
 ## 操作规则
 1. 仔细分析屏幕截图，确定需要操作的元素位置
-2. 每次只执行一个有意义的操作步骤
+2. 你可以在一次回复中调用多个工具，它们会按顺序依次执行，尽量一次性多调用工具以提升操作效率。
 3. 操作后等待屏幕更新，观察结果再决定下一步
 4. 任务完成后必须调用 task_complete
 "#;
@@ -160,8 +160,43 @@ impl ScreenAgentV2 {
         let api_base = config.api_base.trim_end_matches('/');
         let api_url = format!("{}/chat/completions", api_base);
 
+        let installed_apps = match crate::app_manager::list_applications() {
+            Ok(apps) => apps,
+            Err(e) => {
+                eprintln!("⚠️ 获取已安装应用列表失败: {}", e);
+                Vec::new()
+            }
+        };
+
+        let running_apps = match crate::app_manager::list_running_applications() {
+            Ok(apps) => apps,
+            Err(e) => {
+                eprintln!("⚠️ 获取运行中应用列表失败: {}", e);
+                Vec::new()
+            }
+        };
+
+        let app_context = format!(
+            "{}\n\n{}",
+            format_app_list_section("系统已安装的应用程序", &installed_apps),
+            format_app_list_section("当前正在运行的应用程序", &running_apps)
+        );
+
+        let user_prompt_path = "prompt/user.md";
+        let system_prompt = if let Ok(user_content) = std::fs::read_to_string(user_prompt_path) {
+            let user_content = user_content.trim();
+            if !user_content.is_empty() {
+                println!("📝 已加载用户自定义提示词 ({})", user_prompt_path);
+                format!("{}\n\n{}\n\n{}", PREAMBLE, app_context, user_content)
+            } else {
+                format!("{}\n\n{}", PREAMBLE, app_context)
+            }
+        } else {
+            format!("{}\n\n{}", PREAMBLE, app_context)
+        };
+
         let tools = get_tools_definition();
-        let mut messages: Vec<Value> = vec![json!({"role": "system", "content": PREAMBLE})];
+        let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system_prompt})];
 
         let mut task_completed = false;
         let mut final_result = String::new();
@@ -174,7 +209,10 @@ impl ScreenAgentV2 {
                 .map_err(|e| anyhow!("多屏拼接截图失败: {}", e))?;
 
             let instruction = if round == 1 {
-                format!("任务目标：{}\n\n请分析当前屏幕截图，执行下一步操作。", task_goal)
+                format!(
+                    "任务目标：{}\n\n请分析当前屏幕截图，执行下一步操作。",
+                    task_goal
+                )
             } else {
                 format!(
                     "任务目标：{}\n\n请分析当前屏幕截图，继续执行下一步操作。如果任务已完成，请调用 task_complete。",
@@ -236,7 +274,8 @@ impl ScreenAgentV2 {
                 let mut content_printed = false;
 
                 let mut response = response;
-                while let Some(chunk) = response.chunk().await.context("读取流式响应失败")? {
+                while let Some(chunk) = response.chunk().await.context("读取流式响应失败")?
+                {
                     let chunk_text = String::from_utf8_lossy(&chunk);
                     sse_buffer.push_str(&chunk_text);
 
@@ -333,8 +372,16 @@ impl ScreenAgentV2 {
                 }
 
                 let message = AssistantMessage {
-                    content: if full_content.is_empty() { None } else { Some(full_content) },
-                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    content: if full_content.is_empty() {
+                        None
+                    } else {
+                        Some(full_content)
+                    },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                     reasoning_content: if full_reasoning.is_empty() {
                         None
                     } else {
@@ -362,8 +409,9 @@ impl ScreenAgentV2 {
                         })).collect::<Vec<_>>()
                     }));
 
-                    for tc in tool_calls {
+                    for (idx, tc) in tool_calls.iter().enumerate() {
                         let result = execute_tool(&tc.function.name, &tc.function.arguments, &layout)
+                            .await
                             .unwrap_or_else(|e| format!("工具执行失败: {}", e));
 
                         if let Some(summary) = result.strip_prefix("TASK_COMPLETE: ") {
@@ -376,6 +424,10 @@ impl ScreenAgentV2 {
                             "tool_call_id": tc.id,
                             "content": result
                         }));
+
+                        if idx + 1 < tool_calls.len() {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
                     }
 
                     if task_completed {
@@ -397,8 +449,8 @@ impl ScreenAgentV2 {
                 return Ok(final_result);
             }
 
-    prune_old_image_messages(&mut messages);
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            prune_old_image_messages(&mut messages);
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
         Ok(format!(
@@ -408,16 +460,19 @@ impl ScreenAgentV2 {
     }
 }
 
-fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<String> {
-    let args: Value = serde_json::from_str(args)
-        .with_context(|| format!("工具参数不是合法 JSON: {}", args))?;
+async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<String> {
+    let args: Value =
+        serde_json::from_str(args).with_context(|| format!("工具参数不是合法 JSON: {}", args))?;
 
     match name {
         "click" => {
             let norm_x = get_f64(&args, "x")?;
             let norm_y = get_f64(&args, "y")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
-            println!("[工具调用] click | 输入: norm_x={}, norm_y={}", norm_x, norm_y);
+            println!(
+                "[工具调用] click | 输入: norm_x={}, norm_y={}",
+                norm_x, norm_y
+            );
             crate::mouse::click(gx, gy).map_err(|e| anyhow!(e))?;
             let output = format!(
                 "已点击归一化坐标 ({:.0}, {:.0}) -> 全局坐标 ({}, {})",
@@ -462,7 +517,10 @@ fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<Strin
             let norm_x = get_f64(&args, "x")?;
             let norm_y = get_f64(&args, "y")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
-            println!("[工具调用] hover | 输入: norm_x={}, norm_y={}", norm_x, norm_y);
+            println!(
+                "[工具调用] hover | 输入: norm_x={}, norm_y={}",
+                norm_x, norm_y
+            );
             crate::mouse::hover(gx, gy).map_err(|e| anyhow!(e))?;
             let output = format!(
                 "已悬停归一化坐标 ({:.0}, {:.0}) -> 全局坐标 ({}, {})",
@@ -548,8 +606,7 @@ fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<Strin
         "close_application" => {
             let app_name = get_str(&args, "app_name")?;
             println!("[工具调用] close_application | 输入: app_name={}", app_name);
-            crate::app_manager::close_application(app_name)
-                .map_err(|e| anyhow!(e.to_string()))?;
+            crate::app_manager::close_application(app_name).map_err(|e| anyhow!(e.to_string()))?;
             let output = format!("已关闭应用: {}", app_name);
             println!("[工具结果] close_application | 输出: {}", output);
             Ok(output)
@@ -557,25 +614,18 @@ fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<Strin
         "focus_application" => {
             let app_name = get_str(&args, "app_name")?;
             println!("[工具调用] focus_application | 输入: app_name={}", app_name);
-            crate::app_manager::focus_application(app_name)
-                .map_err(|e| anyhow!(e.to_string()))?;
+            crate::app_manager::focus_application(app_name).map_err(|e| anyhow!(e.to_string()))?;
             let output = format!("已聚焦应用: {}", app_name);
             println!("[工具结果] focus_application | 输出: {}", output);
             Ok(output)
         }
-        "list_applications" => {
-            println!("[工具调用] list_applications");
-            let apps = crate::app_manager::list_applications().map_err(|e| anyhow!(e.to_string()))?;
-            let output = serde_json::to_string(&apps)?;
-            println!("[工具结果] list_applications | 输出: {}", output);
-            Ok(output)
-        }
-        "list_running_applications" => {
-            println!("[工具调用] list_running_applications");
-            let apps =
-                crate::app_manager::list_running_applications().map_err(|e| anyhow!(e.to_string()))?;
-            let output = serde_json::to_string(&apps)?;
-            println!("[工具结果] list_running_applications | 输出: {}", output);
+        "wait" => {
+            let seconds: u64 = args["seconds"].as_u64().unwrap_or(3);
+            let seconds = seconds.min(30);
+            println!("[工具调用] wait | 等待 {} 秒", seconds);
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            let output = format!("已等待 {} 秒", seconds);
+            println!("[工具结果] wait | {}", output);
             Ok(output)
         }
         "task_complete" => {
@@ -603,10 +653,23 @@ fn get_tools_definition() -> Value {
         {"type": "function", "function": {"name": "open_application", "description": "打开指定应用程序", "parameters": {"type": "object", "properties": {"app_name": {"type": "string", "description": "应用程序名称"}}, "required": ["app_name"]}}},
         {"type": "function", "function": {"name": "close_application", "description": "关闭指定应用程序", "parameters": {"type": "object", "properties": {"app_name": {"type": "string", "description": "应用程序名称"}}, "required": ["app_name"]}}},
         {"type": "function", "function": {"name": "focus_application", "description": "将指定应用程序聚焦到前台", "parameters": {"type": "object", "properties": {"app_name": {"type": "string", "description": "应用程序名称"}}, "required": ["app_name"]}}},
-        {"type": "function", "function": {"name": "list_applications", "description": "列出系统中已安装的应用程序", "parameters": {"type": "object", "properties": {}}}},
-        {"type": "function", "function": {"name": "list_running_applications", "description": "列出当前正在运行的应用程序", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "wait", "description": "等待指定秒数。用于等待页面加载、动画播放、网络请求完成等需要时间的场景。", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "等待的秒数，建议 1-30 之间"}}, "required": ["seconds"]}}},
         {"type": "function", "function": {"name": "task_complete", "description": "任务完成时调用此工具", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "任务完成摘要"}}, "required": ["summary"]}}}
     ])
+}
+
+fn format_app_list_section(title: &str, apps: &[String]) -> String {
+    if apps.is_empty() {
+        return format!("## {}\n- （未获取到应用列表）", title);
+    }
+
+    let items = apps
+        .iter()
+        .map(|app| format!("- {}", app))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("## {}\n{}", title, items)
 }
 
 fn normalized_to_global(layout: &StitchedLayout, norm_x: f64, norm_y: f64) -> Result<(i32, i32)> {
@@ -615,10 +678,37 @@ fn normalized_to_global(layout: &StitchedLayout, norm_x: f64, norm_y: f64) -> Re
         .map_err(|e| anyhow!("坐标转换失败: {}", e))
 }
 
+/// 从 JSON 值中提取 f64 数值，兼容单值和数组格式。
+/// 单值: {"x": 184} -> 184.0
+/// 数组: {"x": [184, 451]} -> 184.0 (取第一个元素)
+fn extract_f64(value: &Value) -> Option<f64> {
+    if let Some(n) = value.as_f64() {
+        Some(n)
+    } else if let Some(arr) = value.as_array() {
+        arr.first().and_then(Value::as_f64)
+    } else {
+        None
+    }
+}
+
+fn extract_f64_with_warn(value: &Value, field_name: &str) -> Option<f64> {
+    if let Some(n) = value.as_f64() {
+        Some(n)
+    } else if let Some(arr) = value.as_array() {
+        println!(
+            "⚠️  字段 {} 返回了数组格式 {:?}，取第一个元素",
+            field_name, arr
+        );
+        extract_f64(value)
+    } else {
+        None
+    }
+}
+
 fn get_f64(value: &Value, key: &str) -> Result<f64> {
     value
         .get(key)
-        .and_then(Value::as_f64)
+        .and_then(|v| extract_f64_with_warn(v, key))
         .ok_or_else(|| anyhow!("缺少或无效参数: {} (number)", key))
 }
 
@@ -663,9 +753,9 @@ fn prune_old_image_messages(messages: &mut [Value]) {
             .get("content")
             .and_then(Value::as_array)
             .map(|items| {
-                items.iter().any(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("image_url")
-                })
+                items
+                    .iter()
+                    .any(|item| item.get("type").and_then(Value::as_str) == Some("image_url"))
             })
             .unwrap_or(false);
 
