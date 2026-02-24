@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use serde_json::json;
+use rig::completion::message::{ImageDetail, ImageMediaType, UserContent};
+use rig::completion::{Message, Prompt};
+use rig::{OneOrMany, client::CompletionClient};
 
-use crate::ai::load_openai_config;
+use crate::ai::{get_openai_client, load_openai_config};
 
 fn read_image_as_base64(image_path: &str) -> Result<String> {
     let bytes =
@@ -27,54 +29,36 @@ fn detect_mime_type(image_path: &str) -> &str {
     }
 }
 
+fn mime_to_image_media_type(mime_type: &str) -> ImageMediaType {
+    match mime_type {
+        "image/png" => ImageMediaType::PNG,
+        "image/jpeg" => ImageMediaType::JPEG,
+        "image/gif" => ImageMediaType::GIF,
+        "image/webp" => ImageMediaType::WEBP,
+        _ => ImageMediaType::PNG,
+    }
+}
+
 async fn call_vision_api(image_base64: &str, mime_type: &str, prompt: &str) -> Result<String> {
     let config = load_openai_config()?;
-    let endpoint = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
-    let image_data_url = format!("data:{mime_type};base64,{image_base64}");
+    let client = get_openai_client()?;
+    let agent = client.agent(config.model_name).build();
 
-    let payload = json!({
-        "model": config.model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_data_url
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    });
+    let media_type = mime_to_image_media_type(mime_type);
+    let message = Message::User {
+        content: OneOrMany::many(vec![
+            UserContent::text(prompt),
+            UserContent::image_base64(image_base64, Some(media_type), Some(ImageDetail::Auto)),
+        ])
+        .expect("多模态消息内容不能为空"),
+    };
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(endpoint)
-        .bearer_auth(config.api_key)
-        .json(&payload)
-        .send()
+    let response = agent
+        .prompt(message)
         .await
-        .context("调用视觉模型 API 失败")?
-        .error_for_status()
-        .context("视觉模型 API 返回错误状态")?;
+        .context("调用视觉模型 API 失败")?;
 
-    let body: serde_json::Value = response.json().await.context("解析视觉模型 API 响应失败")?;
-
-    let content = body
-        .get("choices")
-        .and_then(|choices| choices.get(0))
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-        .context("视觉模型响应中缺少 choices[0].message.content")?;
-
-    Ok(content.to_string())
+    Ok(response)
 }
 
 pub async fn image_to_html(image_path: &str) -> Result<String> {

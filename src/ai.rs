@@ -30,14 +30,15 @@ pub fn load_openai_config() -> Result<OpenAiConfig> {
     })
 }
 
-pub fn get_openai_client() -> Result<openai::Client> {
+pub fn get_openai_client() -> Result<openai::CompletionsClient> {
     let config = load_openai_config()?;
 
     let client = openai::Client::builder()
         .api_key(&config.api_key)
         .base_url(&config.api_base)
         .build()
-        .context("初始化 rig OpenAI 客户端失败")?;
+        .context("初始化 rig OpenAI 客户端失败")?
+        .completions_api();
 
     Ok(client)
 }
