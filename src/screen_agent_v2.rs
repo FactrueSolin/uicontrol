@@ -147,7 +147,8 @@ impl ScreenAgentV2 {
                     "model": config.model_name,
                     "messages": messages,
                     "tools": tools,
-                    "enable_thinking": false
+                    "enable_thinking": true,
+                    "thinking_budget": -1
                 });
 
                 println!("📤 发送请求...");
@@ -174,7 +175,7 @@ impl ScreenAgentV2 {
 
                 if let Some(usage) = &chat_response.usage {
                     println!(
-                        "📊 Token 用量: prompt={}, completion={}, total={}",
+                        "📊 Token 用量：prompt={}, completion={}, total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     );
                 }
@@ -186,7 +187,9 @@ impl ScreenAgentV2 {
                 let message = &choice.message;
 
                 if let Some(reasoning) = &message.reasoning_content {
-                    println!("🧠 reasoning_content: {}", reasoning);
+                    let preview: String = reasoning.chars().take(200).collect();
+                    let suffix = if reasoning.chars().count() > 200 { "..." } else { "" };
+                    println!("💭 思考过程：{}{}", preview, suffix);
                 }
                 if let Some(content) = &message.content {
                     println!("📥 [第 {} 轮] AI 的输出：", round);
@@ -252,7 +255,7 @@ impl ScreenAgentV2 {
                 return Ok(final_result);
             }
 
-            prune_old_image_messages(&mut messages);
+    prune_old_image_messages(&mut messages);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
