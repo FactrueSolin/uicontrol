@@ -7,5 +7,6 @@ pub mod keyboard;
 pub mod mcp_server;
 pub mod mouse;
 pub mod screen_agent;
+pub mod screen_agent_v2;
 pub mod screenshot;
 pub mod tools;
