@@ -73,3 +73,19 @@ pub fn close_application(app_name: &str) -> Result<(), Box<dyn Error>> {
         Err(format!("关闭应用失败: {}", app_name).into())
     }
 }
+
+/// 将指定应用切换到前台并聚焦。
+pub fn focus_application(app_name: &str) -> Result<(), Box<dyn Error>> {
+    let script = format!("tell application \"{}\" to activate", app_name);
+
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("切换应用焦点失败: {}", app_name).into());
+    }
+
+    Ok(())
+}

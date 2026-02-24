@@ -97,6 +97,20 @@ impl AppManagerServer {
         Ok(CallToolResult::success(vec![Content::text(ui_tree)]))
     }
 
+    #[tool(name = "focus_app", description = "切换焦点至指定应用程序（将应用带到前台）")]
+    fn focus_app(
+        &self,
+        Parameters(AppNameRequest { app_name }): Parameters<AppNameRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        app_manager::focus_application(&app_name)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "已切换焦点至应用：{}",
+            app_name
+        ))]))
+    }
+
     // #[tool(
     //     name = "take_screenshot",
     //     description = "截图工具：可指定 display_id 截图单屏，不传则截图所有屏幕"
@@ -125,7 +139,7 @@ impl ServerHandler for AppManagerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/get_ui_tree/take_screenshot 工具"
+                "应用程序管理 MCP server，提供 list_apps/list_running_apps/open_app/close_app/focus_app/get_ui_tree/take_screenshot 工具"
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
