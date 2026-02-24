@@ -5,3 +5,9 @@ rmcp-example
 
 *.env
 /testdata
+
+# Added by git-get
+rig
+
+# Added by git-get
+rig-integration
