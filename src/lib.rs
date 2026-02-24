@@ -9,4 +9,5 @@ pub mod mouse;
 pub mod screen_agent;
 pub mod screen_agent_v2;
 pub mod screenshot;
+pub mod shortcut;
 pub mod tools;

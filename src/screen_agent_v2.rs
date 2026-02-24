@@ -3,13 +3,12 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
+use std::process::Command;
 use tokio::time::Duration;
 
 use crate::ai::load_openai_config;
 use crate::display::{get_stitched_layout, StitchedLayout};
 use crate::screenshot::take_stitched_screenshot;
-
-const MAX_ROUNDS: usize = 20;
 
 const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看到当前屏幕截图，并通过工具执行操作来完成用户的任务。
 
@@ -41,13 +40,18 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 
 ### 任务控制
 - wait(seconds) - 等待指定秒数，用于等待页面加载、动画完成等场景
+- ask_human(question) - 向人类提问或请求帮助。当你不确定如何操作、需要人类协助完成某个步骤、或需要人类提供额外信息时使用此工具。
 - task_complete(summary) - 任务完成时调用，summary 为完成摘要
+
+### 系统工具
+- read_clipboard() - 读取系统剪贴板中的文本内容
 
 ## 操作规则
 1. 仔细分析屏幕截图，确定需要操作的元素位置
 2. 你可以在一次回复中调用多个工具，它们会按顺序依次执行，尽量一次性多调用工具以提升操作效率。
 3. 操作后等待屏幕更新，观察结果再决定下一步
 4. 任务完成后必须调用 task_complete
+5. 控制应用时优先使用快捷键（hotkey / press_key）完成操作，仅在快捷键不可用或无法确定时再使用鼠标。
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +163,10 @@ impl ScreenAgentV2 {
         let http_client = Client::new();
         let api_base = config.api_base.trim_end_matches('/');
         let api_url = format!("{}/chat/completions", api_base);
+        let max_rounds: usize = std::env::var("AGENT_MAX_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
 
         let installed_apps = match crate::app_manager::list_applications() {
             Ok(apps) => apps,
@@ -200,8 +208,33 @@ impl ScreenAgentV2 {
 
         let mut task_completed = false;
         let mut final_result = String::new();
+        let mut round: usize = 1;
 
-        for round in 1..=MAX_ROUNDS {
+        loop {
+            if round > max_rounds {
+                println!("⏸️  已达到最大轮次 ({})，暂停等待人类指示", max_rounds);
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("请输入新的指示（直接回车或输入 quit 退出）：");
+
+                let mut human_input = String::new();
+                std::io::stdin().read_line(&mut human_input).unwrap_or_default();
+                let human_input = human_input.trim();
+
+                if human_input.is_empty() || human_input == "quit" || human_input == "exit" {
+                    println!("👋 用户选择退出");
+                    break;
+                }
+
+                messages.push(json!({
+                    "role": "user",
+                    "content": format!("用户补充指示：{}", human_input)
+                }));
+
+                round = 1;
+                println!("▶️  继续执行，轮次已重置");
+                continue;
+            }
+
             println!("--- 第 {} 轮 ---", round);
 
             let layout = get_stitched_layout().context("获取屏幕布局失败")?;
@@ -220,16 +253,24 @@ impl ScreenAgentV2 {
                 )
             };
 
+            let app_shortcuts_context = build_focused_app_shortcuts_context();
+
+            let final_instruction = if let Some(shortcuts_context) = app_shortcuts_context {
+                format!("{}\n\n{}", instruction, shortcuts_context)
+            } else {
+                instruction.clone()
+            };
+
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!("📤 [第 {} 轮] 发送给 AI 的输入：", round);
-            println!("{}", instruction);
+            println!("{}", final_instruction);
             println!("[截图已附带]");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
             messages.push(json!({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": instruction},
+                    {"type": "text", "text": final_instruction},
                     {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", screenshot_base64)}}
                 ]
             }));
@@ -451,11 +492,12 @@ impl ScreenAgentV2 {
 
             prune_old_image_messages(&mut messages);
             tokio::time::sleep(Duration::from_secs(3)).await;
+            round += 1;
         }
 
         Ok(format!(
             "达到最大轮次 {}，最后结果: {}",
-            MAX_ROUNDS, final_result
+            max_rounds, final_result
         ))
     }
 }
@@ -628,12 +670,55 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             println!("[工具结果] wait | {}", output);
             Ok(output)
         }
+        "ask_human" => {
+            let question = args["question"].as_str().unwrap_or("需要你的帮助");
+            println!("[工具调用] ask_human");
+            println!("🙋 AI 请求人类帮助：");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("{}", question);
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("请输入你的回复（输入完成后按回车）：");
+
+            let mut human_input = String::new();
+            std::io::stdin().read_line(&mut human_input).unwrap_or_default();
+            let human_input = human_input.trim().to_string();
+
+            let result = if human_input.is_empty() {
+                "人类未提供回复".to_string()
+            } else {
+                format!("人类回复：{}", human_input)
+            };
+            println!("[工具结果] ask_human | {}", result);
+            Ok(result)
+        }
         "task_complete" => {
             let summary = get_optional_str(&args, "summary").unwrap_or("任务完成");
             println!("[工具调用] task_complete | 输入: summary={}", summary);
             let output = format!("TASK_COMPLETE: {}", summary);
             println!("[工具结果] task_complete | 输出: {}", output);
             Ok(output)
+        }
+        "read_clipboard" => {
+            println!("[工具调用] read_clipboard");
+            let output = std::process::Command::new("pbpaste").output();
+            match output {
+                Ok(out) => {
+                    let content = String::from_utf8_lossy(&out.stdout).to_string();
+                    if content.is_empty() {
+                        let result = "剪贴板为空".to_string();
+                        println!("[工具结果] read_clipboard | {}", result);
+                        Ok(result)
+                    } else {
+                        println!("[工具结果] read_clipboard | 内容长度: {} 字符", content.len());
+                        Ok(content)
+                    }
+                }
+                Err(e) => {
+                    let result = format!("读取剪贴板失败: {}", e);
+                    println!("[工具结果] read_clipboard | {}", result);
+                    Ok(result)
+                }
+            }
         }
         _ => Err(anyhow!("未知工具: {}", name)),
     }
@@ -654,7 +739,9 @@ fn get_tools_definition() -> Value {
         {"type": "function", "function": {"name": "close_application", "description": "关闭指定应用程序", "parameters": {"type": "object", "properties": {"app_name": {"type": "string", "description": "应用程序名称"}}, "required": ["app_name"]}}},
         {"type": "function", "function": {"name": "focus_application", "description": "将指定应用程序聚焦到前台", "parameters": {"type": "object", "properties": {"app_name": {"type": "string", "description": "应用程序名称"}}, "required": ["app_name"]}}},
         {"type": "function", "function": {"name": "wait", "description": "等待指定秒数。用于等待页面加载、动画播放、网络请求完成等需要时间的场景。", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "等待的秒数，建议 1-30 之间"}}, "required": ["seconds"]}}},
-        {"type": "function", "function": {"name": "task_complete", "description": "任务完成时调用此工具", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "任务完成摘要"}}, "required": ["summary"]}}}
+        {"type": "function", "function": {"name": "ask_human", "description": "向人类提问或请求帮助。当你不确定如何操作、需要人类协助完成某个步骤、或需要人类提供额外信息时使用此工具。程序会暂停等待人类输入回复。", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "向人类提出的问题或请求描述"}}, "required": ["question"]}}},
+        {"type": "function", "function": {"name": "task_complete", "description": "任务完成时调用此工具", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "任务完成摘要"}}, "required": ["summary"]}}},
+        {"type": "function", "function": {"name": "read_clipboard", "description": "读取系统剪贴板中的文本内容。用于查看用户或程序复制到剪贴板的文本。", "parameters": {"type": "object", "properties": {}, "required": []}}}
     ])
 }
 
@@ -829,4 +916,56 @@ fn finalize_stream_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
             })
         })
         .collect()
+}
+
+fn build_focused_app_shortcuts_context() -> Option<String> {
+    let app_name = get_focused_app_name()?;
+    let shortcuts = crate::shortcut::get_app_menu_shortcuts(&app_name).ok()?;
+
+    let mut lines = Vec::new();
+    lines.push(format!("当前聚焦应用: {}", app_name));
+
+    if shortcuts.is_empty() {
+        lines.push("该应用可用的菜单栏快捷键: （未获取到）".to_string());
+    } else {
+        lines.push("该应用可用的菜单栏快捷键:".to_string());
+        for item in shortcuts.iter() {
+            let hotkey = format_shortcut_key(&item.modifiers, &item.key);
+            lines.push(format!("- {}: {}", hotkey, item.menu_path));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("提示：控制应用时，优先使用快捷键而非鼠标点击菜单，这样更快更可靠。".to_string());
+
+    Some(lines.join("\n"))
+}
+
+fn get_focused_app_name() -> Option<String> {
+    let script = r#"tell application "System Events" to get name of first application process whose frontmost is true"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let app_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if app_name.is_empty() {
+        None
+    } else {
+        Some(app_name)
+    }
+}
+
+fn format_shortcut_key(modifiers: &str, key: &str) -> String {
+    let key = key.trim();
+    if modifiers.trim().is_empty() {
+        key.to_string()
+    } else {
+        format!("{}{}", modifiers.trim(), key)
+    }
 }

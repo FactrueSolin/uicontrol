@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 /// 获取已安装的应用程序列表。
 pub fn list_applications() -> Result<Vec<String>, Box<dyn Error>> {
@@ -76,7 +78,8 @@ pub fn close_application(app_name: &str) -> Result<(), Box<dyn Error>> {
 
 /// 将指定应用切换到前台并聚焦。
 pub fn focus_application(app_name: &str) -> Result<(), Box<dyn Error>> {
-    let script = format!("tell application \"{}\" to activate", app_name);
+    let clean_name = app_name.trim().trim_end_matches(".app");
+    let script = format!("tell application \"{}\" to activate", clean_name);
 
     let status = Command::new("osascript")
         .arg("-e")
@@ -84,8 +87,43 @@ pub fn focus_application(app_name: &str) -> Result<(), Box<dyn Error>> {
         .status()?;
 
     if !status.success() {
-        return Err(format!("切换应用焦点失败: {}", app_name).into());
+        return Err(format!("AppleScript activate 执行失败: {}", clean_name).into());
     }
 
-    Ok(())
+    thread::sleep(Duration::from_millis(500));
+    if is_app_focused(clean_name) {
+        return Ok(());
+    }
+
+    println!(
+        "⚠️  AppleScript activate 未生效，尝试 open -a {}",
+        clean_name
+    );
+    let open_status = Command::new("open").arg("-a").arg(clean_name).status()?;
+    if !open_status.success() {
+        return Err(format!("open -a 执行失败: {}", clean_name).into());
+    }
+
+    thread::sleep(Duration::from_millis(500));
+    if is_app_focused(clean_name) {
+        return Ok(());
+    }
+
+    Err(format!("无法聚焦应用 '{}'，两种方式均失败", clean_name).into())
+}
+
+fn is_app_focused(app_name: &str) -> bool {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
+        .output();
+
+    match output {
+        Ok(out) => {
+            let current = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+            let target = app_name.trim().to_lowercase();
+            current.contains(&target) || target.contains(&current)
+        }
+        Err(_) => false,
+    }
 }
