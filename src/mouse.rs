@@ -20,6 +20,14 @@ pub fn right_click(x: i32, y: i32) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn click(x: i32, y: i32) -> Result<(), String> {
+    let mut enigo = create_enigo()?;
+    move_to(&mut enigo, x, y)?;
+    enigo
+        .button(Button::Left, Direction::Click)
+        .map_err(|e| e.to_string())
+}
+
 pub fn double_click(x: i32, y: i32) -> Result<(), String> {
     let mut enigo = create_enigo()?;
     move_to(&mut enigo, x, y)?;

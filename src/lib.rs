@@ -5,4 +5,6 @@ pub mod document_parser;
 pub mod keyboard;
 pub mod mcp_server;
 pub mod mouse;
+pub mod screen_agent;
 pub mod screenshot;
+pub mod tools;
