@@ -3,6 +3,7 @@ use rig::completion::message::{ImageDetail, ImageMediaType, UserContent};
 use rig::completion::request::PromptError;
 use rig::completion::{Message, Prompt};
 use rig::{client::CompletionClient, OneOrMany};
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -81,6 +82,7 @@ impl ScreenAgent {
             .agent(config.model_name.clone())
             .preamble(PREAMBLE)
             .default_max_turns(3)
+            .additional_params(json!({"enable_thinking": false}))
             // 鼠标工具
             .tool(ClickTool {
                 layout: Arc::clone(&layout_state),
@@ -117,6 +119,7 @@ impl ScreenAgent {
             .build();
 
         let mut last_response = String::new();
+        let mut printed_layout_diagnostics = false;
 
         // 外层循环：每轮截图 + 发送
         for round in 1..=MAX_ROUNDS {
@@ -124,6 +127,31 @@ impl ScreenAgent {
 
             // 1. 获取布局并进行多屏拼接截图
             let layout = get_stitched_layout().map_err(|e| anyhow!("获取屏幕布局失败: {}", e))?;
+
+            if !printed_layout_diagnostics {
+                println!("📺 屏幕布局信息：");
+                for (i, display) in layout.displays.iter().enumerate() {
+                    println!(
+                        "  显示器 {} (id={}): {}x{} @ origin({}, {}), scale={}",
+                        i + 1,
+                        display.display_id,
+                        display.logical_width,
+                        display.logical_height,
+                        display.origin_x,
+                        display.origin_y,
+                        display.scale_factor
+                    );
+                }
+                println!(
+                    "  拼接图尺寸: {}x{}",
+                    layout.stitched_width, layout.stitched_height
+                );
+                for (i, offset) in layout.offsets.iter().enumerate() {
+                    println!("  显示器 {} 在拼接图中的偏移: ({}, {})", i + 1, offset.0, offset.1);
+                }
+                printed_layout_diagnostics = true;
+            }
+
             let (screenshot_base64_owned, stitched_layout) = screenshot::take_stitched_screenshot(&layout)
                 .map_err(|e| anyhow!("多屏拼接截图失败: {}", e))?;
 
@@ -135,6 +163,8 @@ impl ScreenAgent {
             }
 
             let screenshot_base64 = screenshot_base64_owned.as_str();
+
+            println!("📸 拼接截图大小: {} KB", screenshot_base64.len() / 1024);
 
             // 2. 构建多模态消息
             let instruction = if round == 1 {
@@ -184,8 +214,21 @@ impl ScreenAgent {
                     last_response = "工具已执行，等待下一轮截图确认结果".to_string();
                 }
                 Err(e) => {
-                    println!("❌ [第 {} 轮] agent 调用失败: {}", round, e);
-                    return Err(anyhow!("第 {} 轮 agent 调用失败: {}", round, e));
+                    let err_str = e.to_string();
+                    if err_str.contains("MaxTurnError") || err_str.contains("max turn") {
+                        println!(
+                            "⚠️  [第 {} 轮] 工具已执行，多轮对话达到上限，继续下一轮截图",
+                            round
+                        );
+                        last_response = "工具已执行，等待下一轮截图确认结果".to_string();
+                    } else if err_str.contains("ApiResponse") || err_str.contains("JsonError") {
+                        println!("⚠️  [第 {} 轮] API 响应解析失败: {}", round, err_str);
+                        println!("⚠️  继续下一轮截图");
+                        last_response = "工具已执行，等待下一轮截图确认结果".to_string();
+                    } else {
+                        println!("❌ [第 {} 轮] agent 调用失败: {}", round, err_str);
+                        return Err(anyhow!("第 {} 轮 agent 调用失败: {}", round, err_str));
+                    }
                 }
             }
 

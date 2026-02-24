@@ -62,7 +62,6 @@ pub fn get_active_displays() -> Result<Vec<DisplayInfo>> {
         });
     }
 
-    displays.sort_by_key(|d| d.display_id);
     Ok(displays)
 }
 

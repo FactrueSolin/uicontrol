@@ -1,4 +1,6 @@
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings};
+use core_graphics::display::CGDisplay;
+use core_graphics::geometry::CGPoint;
+use enigo::{Axis, Button, Direction, Enigo, Mouse, Settings};
 use std::thread;
 use std::time::Duration;
 
@@ -6,10 +8,17 @@ fn create_enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| e.to_string())
 }
 
-fn move_to(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
-    enigo
-        .move_mouse(x, y, Coordinate::Abs)
-        .map_err(|e| e.to_string())
+// 使用 macOS 原生 API 移动鼠标到全局绝对坐标
+fn move_to_absolute(x: i32, y: i32) -> Result<(), String> {
+    let point = CGPoint::new(x as f64, y as f64);
+    CGDisplay::warp_mouse_cursor_position(point).map_err(|e| format!("移动鼠标失败: {:?}", e))
+}
+
+fn move_to(_enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
+    move_to_absolute(x, y)?;
+    // 给系统一点时间处理鼠标移动
+    thread::sleep(Duration::from_millis(50));
+    Ok(())
 }
 
 pub fn right_click(x: i32, y: i32) -> Result<(), String> {
