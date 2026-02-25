@@ -1,19 +1,17 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 
 use crate::ai::load_openai_config;
 use crate::config::AppConfig;
 use crate::display::{get_stitched_layout, StitchedLayout};
 use crate::screenshot::take_stitched_screenshot;
+use crate::session::{api_message_to_session_message, Session};
 
 const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看到当前屏幕截图，并通过工具执行操作来完成用户的任务。
 
@@ -60,6 +58,8 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 4. 任务完成后必须调用 task_complete
 5. 控制应用时优先使用快捷键（hotkey / press_key）完成操作，仅在快捷键不可用或无法确定时再使用鼠标。
 6. 需要页面滚动时，优先使用 page_down/page_up；仅在必须精确滚轮控制时使用 scroll。
+7. 优先使用系统中有的软件，接着是浏览器网页。
+8. 注意qcu是你自己，你不能调用你自己。
 "#;
 
 const SCREEN_UNCHANGED_HINT: &str =
@@ -166,50 +166,59 @@ struct PendingToolCall {
     arguments: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct SessionChatLog {
-    task: String,
-    start_time: String,
-    rounds: Vec<RoundChatLog>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct RoundChatLog {
-    round: usize,
-    input_text: String,
-    ai_thinking: String,
-    ai_response: String,
-    tool_calls: Vec<ToolCallLog>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct ToolCallLog {
-    name: String,
-    arguments: Value,
-    result: String,
+#[derive(Debug, Clone)]
+pub enum TaskResult {
+    Completed(String),
+    MaxRoundsReached(u32),
+    UserInterrupt,
 }
 
 pub struct ScreenAgentV2;
 
 impl ScreenAgentV2 {
     pub async fn run(task_goal: &str) -> Result<String> {
+        let agent = ScreenAgentV2;
+        let mut messages = Vec::new();
+        let mut session = Session::new();
+        session.title = task_goal.chars().take(50).collect();
+
+        let result = agent
+            .run_task(task_goal, &mut messages, &mut session)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        match result {
+            TaskResult::Completed(summary) => Ok(summary),
+            TaskResult::MaxRoundsReached(max_rounds) => {
+                Ok(format!("达到最大轮次 {}，任务已暂停", max_rounds))
+            }
+            TaskResult::UserInterrupt => Ok("用户中断任务".to_string()),
+        }
+    }
+
+    pub async fn run_task(
+        &self,
+        task_goal: &str,
+        messages: &mut Vec<serde_json::Value>,
+        session: &mut Session,
+    ) -> std::result::Result<TaskResult, Box<dyn std::error::Error>> {
         let app_config = AppConfig::load().context("加载应用配置失败")?;
         let config = load_openai_config()?;
-        let session_timestamp = now_unix_timestamp();
-        let chat_log_path = build_chat_log_path(&session_timestamp);
-        let session_chat_log = Arc::new(Mutex::new(SessionChatLog {
-            task: task_goal.to_string(),
-            start_time: session_timestamp,
-            rounds: Vec::new(),
-        }));
-
-        let ctrlc_log = Arc::clone(&session_chat_log);
-        let ctrlc_path = chat_log_path.clone();
+        let ctrlc_session = Arc::new(Mutex::new(session.clone()));
+        let ctrlc_snapshot = Arc::clone(&ctrlc_session);
         let ctrlc_handle = tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("\n⚠️ 收到 Ctrl+C 信号，正在保存聊天记录...");
-                if let Err(e) = save_chat_log_from_shared(&ctrlc_path, &ctrlc_log).await {
-                    eprintln!("❌ Ctrl+C 保存聊天记录失败: {}", e);
+                eprintln!("\n⚠️ 收到 Ctrl+C 信号，正在保存会话...");
+                let session_snapshot = match ctrlc_snapshot.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(e) => {
+                        eprintln!("❌ Ctrl+C 获取会话快照失败: {}", e);
+                        std::process::exit(130);
+                    }
+                };
+
+                if let Err(e) = session_snapshot.save() {
+                    eprintln!("❌ Ctrl+C 保存会话失败: {}", e);
                 }
                 eprintln!("👋 进程已退出");
                 std::process::exit(130);
@@ -221,43 +230,13 @@ impl ScreenAgentV2 {
         let api_url = format!("{}/chat/completions", api_base);
         let max_rounds: usize = app_config.agent_max_rounds;
 
-        let installed_apps = match crate::app_manager::list_applications() {
-            Ok(apps) => apps,
-            Err(e) => {
-                eprintln!("⚠️ 获取已安装应用列表失败: {}", e);
-                Vec::new()
-            }
-        };
-
-        let running_apps = match crate::app_manager::list_running_applications() {
-            Ok(apps) => apps,
-            Err(e) => {
-                eprintln!("⚠️ 获取运行中应用列表失败: {}", e);
-                Vec::new()
-            }
-        };
-
-        let app_context = format!(
-            "{}\n\n{}",
-            format_app_list_section("系统已安装的应用程序", &installed_apps),
-            format_app_list_section("当前正在运行的应用程序", &running_apps)
-        );
-
-        let user_prompt_path = "prompt/user.md";
-        let system_prompt = if let Ok(user_content) = std::fs::read_to_string(user_prompt_path) {
-            let user_content = user_content.trim();
-            if !user_content.is_empty() {
-                println!("📝 已加载用户自定义提示词 ({})", user_prompt_path);
-                format!("{}\n\n{}\n\n{}", PREAMBLE, app_context, user_content)
-            } else {
-                format!("{}\n\n{}", PREAMBLE, app_context)
-            }
-        } else {
-            format!("{}\n\n{}", PREAMBLE, app_context)
-        };
-
         let tools = get_tools_definition();
-        let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system_prompt})];
+
+        if messages.is_empty() {
+            let system_prompt = self.build_system_prompt();
+            append_message(messages, session, system_prompt);
+            update_ctrlc_session_snapshot(&ctrlc_session, session);
+        }
 
         let mut task_completed = false;
         let mut final_result = String::new();
@@ -270,30 +249,13 @@ impl ScreenAgentV2 {
                 println!("⏸️  已达到最大轮次 ({})，暂停等待人类指示", max_rounds);
                 send_notification(
                     "⚠️ 已达到最大轮次",
-                    &format!("已执行 {} 轮，等待人类指示", max_rounds),
+                    &format!("已执行 {} 轮，任务暂停并返回 REPL", max_rounds),
                 );
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("请输入新的指示（直接回车或输入 quit 退出）：");
 
-                let mut human_input = String::new();
-                std::io::stdin()
-                    .read_line(&mut human_input)
-                    .unwrap_or_default();
-                let human_input = human_input.trim();
-
-                if human_input.is_empty() || human_input == "quit" || human_input == "exit" {
-                    println!("👋 用户选择退出");
-                    break;
-                }
-
-                messages.push(json!({
-                    "role": "user",
-                    "content": format!("用户补充指示：{}", human_input)
-                }));
-
-                round = 1;
-                println!("▶️  继续执行，轮次已重置");
-                continue;
+                session.save()?;
+                update_ctrlc_session_snapshot(&ctrlc_session, session);
+                ctrlc_handle.abort();
+                return Ok(TaskResult::MaxRoundsReached(max_rounds as u32));
             }
 
             println!("--- 第 {} 轮 ---", round);
@@ -364,20 +326,6 @@ impl ScreenAgentV2 {
             }
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-            let round_input_text = if attach_screenshot {
-                final_instruction.clone()
-            } else {
-                format!("{}\n\n{}", final_instruction, SCREEN_UNCHANGED_HINT)
-            };
-
-            let mut round_chat_log = RoundChatLog {
-                round,
-                input_text: round_input_text,
-                ai_thinking: String::new(),
-                ai_response: String::new(),
-                tool_calls: Vec::new(),
-            };
-
             let mut user_content = vec![json!({"type": "text", "text": final_instruction})];
             if attach_screenshot {
                 user_content.push(json!({
@@ -388,10 +336,12 @@ impl ScreenAgentV2 {
                 user_content.push(json!({"type": "text", "text": SCREEN_UNCHANGED_HINT}));
             }
 
-            messages.push(json!({
+            let user_msg = json!({
                 "role": "user",
                 "content": user_content
-            }));
+            });
+            append_message(messages, session, user_msg);
+            update_ctrlc_session_snapshot(&ctrlc_session, session);
 
             loop {
                 let request_body = json!({
@@ -548,9 +498,6 @@ impl ScreenAgentV2 {
                     },
                 };
 
-                round_chat_log.ai_thinking = message.reasoning_content.clone().unwrap_or_default();
-                round_chat_log.ai_response = message.content.clone().unwrap_or_default();
-
                 if let Some(tool_calls) = &message.tool_calls {
                     let assistant_content = message
                         .content
@@ -558,7 +505,7 @@ impl ScreenAgentV2 {
                         .map(Value::String)
                         .unwrap_or(Value::Null);
 
-                    messages.push(json!({
+                    let assistant_msg = json!({
                         "role": "assistant",
                         "content": assistant_content,
                         "tool_calls": tool_calls.iter().map(|tc| json!({
@@ -569,21 +516,42 @@ impl ScreenAgentV2 {
                                 "arguments": tc.function.arguments
                             }
                         })).collect::<Vec<_>>()
-                    }));
+                    });
+                    append_message(messages, session, assistant_msg);
+                    update_ctrlc_session_snapshot(&ctrlc_session, session);
 
                     for (idx, tc) in tool_calls.iter().enumerate() {
+                        if tc.function.name == "ask_human" {
+                            let question = serde_json::from_str::<Value>(&tc.function.arguments)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("question")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_else(|| "需要你的帮助".to_string());
+
+                            send_notification("💬 AI 需要你的帮助", &question);
+
+                            let tool_msg = json!({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": format!("ASK_HUMAN: {}", question)
+                            });
+                            append_message(messages, session, tool_msg);
+                            update_ctrlc_session_snapshot(&ctrlc_session, session);
+
+                            println!("⏸️ ask_human 已触发，暂停任务并返回 REPL");
+                            session.save()?;
+                            update_ctrlc_session_snapshot(&ctrlc_session, session);
+                            ctrlc_handle.abort();
+                            return Ok(TaskResult::UserInterrupt);
+                        }
+
                         let result =
                             execute_tool(&tc.function.name, &tc.function.arguments, &layout)
                                 .await
                                 .unwrap_or_else(|e| format!("工具执行失败: {}", e));
-
-                        let arguments = serde_json::from_str::<Value>(&tc.function.arguments)
-                            .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
-                        round_chat_log.tool_calls.push(ToolCallLog {
-                            name: tc.function.name.clone(),
-                            arguments,
-                            result: result.clone(),
-                        });
 
                         if let Some(summary) = result.strip_prefix("TASK_COMPLETE: ") {
                             task_completed = true;
@@ -591,11 +559,20 @@ impl ScreenAgentV2 {
                             send_notification("✅ 任务已完成", summary);
                         }
 
-                        messages.push(json!({
+                        let tool_msg = json!({
                             "role": "tool",
                             "tool_call_id": tc.id,
                             "content": result
-                        }));
+                        });
+                        append_message(messages, session, tool_msg);
+                        update_ctrlc_session_snapshot(&ctrlc_session, session);
+
+                        if task_completed {
+                            session.save()?;
+                            update_ctrlc_session_snapshot(&ctrlc_session, session);
+                            ctrlc_handle.abort();
+                            return Ok(TaskResult::Completed(final_result));
+                        }
 
                         if idx + 1 < tool_calls.len() {
                             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -609,32 +586,85 @@ impl ScreenAgentV2 {
                 if let Some(content) = &message.content {
                     final_result = content.clone();
                 }
-                messages.push(json!({"role": "assistant", "content": message.content}));
+
+                let assistant_msg = json!({"role": "assistant", "content": message.content});
+                append_message(messages, session, assistant_msg);
+                update_ctrlc_session_snapshot(&ctrlc_session, session);
+
+                if let Some(content) = &message.content {
+                    if let Some(summary) = extract_task_complete_summary(content) {
+                        send_notification("✅ 任务已完成", summary);
+
+                        session.save()?;
+                        update_ctrlc_session_snapshot(&ctrlc_session, session);
+                        ctrlc_handle.abort();
+                        return Ok(TaskResult::Completed(summary.to_string()));
+                    }
+                }
                 break;
             }
 
-            {
-                let mut chat_log = session_chat_log.lock().await;
-                chat_log.rounds.push(round_chat_log);
-            }
+            session.save()?;
+            update_ctrlc_session_snapshot(&ctrlc_session, session);
 
             if task_completed {
                 ctrlc_handle.abort();
-                save_chat_log_from_shared(&chat_log_path, &session_chat_log).await?;
-                return Ok(final_result);
+                return Ok(TaskResult::Completed(final_result));
             }
 
             tokio::time::sleep(Duration::from_secs(3)).await;
             round += 1;
         }
+    }
 
-        ctrlc_handle.abort();
-        save_chat_log_from_shared(&chat_log_path, &session_chat_log).await?;
+    fn build_system_prompt(&self) -> Value {
+        let installed_apps = match crate::app_manager::list_applications() {
+            Ok(apps) => apps,
+            Err(e) => {
+                eprintln!("⚠️ 获取已安装应用列表失败: {}", e);
+                Vec::new()
+            }
+        };
 
-        Ok(format!(
-            "达到最大轮次 {}，最后结果: {}",
-            max_rounds, final_result
-        ))
+        let running_apps = match crate::app_manager::list_running_applications() {
+            Ok(apps) => apps,
+            Err(e) => {
+                eprintln!("⚠️ 获取运行中应用列表失败: {}", e);
+                Vec::new()
+            }
+        };
+
+        let app_context = format!(
+            "{}\n\n{}",
+            format_app_list_section("系统已安装的应用程序", &installed_apps),
+            format_app_list_section("当前正在运行的应用程序", &running_apps)
+        );
+
+        let user_prompt_path = "prompt/user.md";
+        let system_prompt = if let Ok(user_content) = std::fs::read_to_string(user_prompt_path) {
+            let user_content = user_content.trim();
+            if !user_content.is_empty() {
+                println!("📝 已加载用户自定义提示词 ({})", user_prompt_path);
+                format!("{}\n\n{}\n\n{}", PREAMBLE, app_context, user_content)
+            } else {
+                format!("{}\n\n{}", PREAMBLE, app_context)
+            }
+        } else {
+            format!("{}\n\n{}", PREAMBLE, app_context)
+        };
+
+        json!({"role": "system", "content": system_prompt})
+    }
+}
+
+fn append_message(messages: &mut Vec<Value>, session: &mut Session, msg: Value) {
+    session.add_message(api_message_to_session_message(&msg));
+    messages.push(msg);
+}
+
+fn update_ctrlc_session_snapshot(shared_session: &Arc<Mutex<Session>>, session: &Session) {
+    if let Ok(mut guard) = shared_session.lock() {
+        *guard = session.clone();
     }
 }
 
@@ -735,8 +765,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "drag" => {
-            let (from_x, from_y) =
-                extract_coordinates(&args, "from_x", "from_y", "drag(from)")?;
+            let (from_x, from_y) = extract_coordinates(&args, "from_x", "from_y", "drag(from)")?;
             let (to_x, to_y) = extract_coordinates(&args, "to_x", "to_y", "drag(to)")?;
             let (gfx, gfy) = normalized_to_global(layout, from_x, from_y)?;
             let (gtx, gty) = normalized_to_global(layout, to_x, to_y)?;
@@ -905,6 +934,16 @@ fn send_notification(title: &str, message: &str) {
     }
 }
 
+fn extract_task_complete_summary(content: &str) -> Option<&str> {
+    content
+        .find("TASK_COMPLETE")
+        .map(|idx| {
+            let tail = &content[idx + "TASK_COMPLETE".len()..];
+            tail.trim_start_matches(':').trim()
+        })
+        .filter(|summary| !summary.is_empty())
+}
+
 fn format_app_list_section(title: &str, apps: &[String]) -> String {
     if apps.is_empty() {
         return format!("## {}\n- （未获取到应用列表）", title);
@@ -931,7 +970,12 @@ fn normalized_to_global(layout: &StitchedLayout, norm_x: f64, norm_y: f64) -> Re
 /// - 常规：{"x": 200, "y": 50}
 /// - 特殊：{"x": [200, 50]}（会将 x=200, y=50）
 /// - 特殊：{"y": [200, 50]}（会将 x=200, y=50）
-fn extract_coordinates(args: &Value, x_key: &str, y_key: &str, tool_name: &str) -> Result<(f64, f64)> {
+fn extract_coordinates(
+    args: &Value,
+    x_key: &str,
+    y_key: &str,
+    tool_name: &str,
+) -> Result<(f64, f64)> {
     if let Some((x, y)) = extract_coordinate_pair_from_field(args, x_key) {
         println!(
             "⚠️  工具 {} 的字段 {} 返回数组格式，按坐标对解析: x={}, y={}",
@@ -1128,40 +1172,4 @@ fn format_shortcut_key(modifiers: &str, key: &str) -> String {
     } else {
         format!("{}{}", modifiers.trim(), key)
     }
-}
-
-fn now_unix_timestamp() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
-fn build_chat_log_path(timestamp: &str) -> PathBuf {
-    PathBuf::from("data").join(format!("chat_{}.json", timestamp))
-}
-
-fn save_chat_log(path: &Path, log: &SessionChatLog) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
-    }
-
-    let content = serde_json::to_string_pretty(log).context("聊天记录序列化失败")?;
-    std::fs::write(path, content)
-        .with_context(|| format!("写入聊天记录文件失败: {}", path.display()))?;
-
-    println!("💾 聊天记录已保存: {}", path.display());
-    Ok(())
-}
-
-async fn save_chat_log_from_shared(
-    path: &Path,
-    shared_log: &Arc<Mutex<SessionChatLog>>,
-) -> Result<()> {
-    let snapshot = {
-        let log = shared_log.lock().await;
-        log.clone()
-    };
-    save_chat_log(path, &snapshot)
 }

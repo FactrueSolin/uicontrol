@@ -3873,6 +3873,7 @@ dependencies = [
  "anyhow",
  "axum 0.7.9",
  "base64",
+ "chrono",
  "clap",
  "core-foundation 0.9.4",
  "core-foundation-sys",
@@ -3895,6 +3896,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
