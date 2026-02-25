@@ -268,6 +268,10 @@ impl ScreenAgentV2 {
         loop {
             if round > max_rounds {
                 println!("⏸️  已达到最大轮次 ({})，暂停等待人类指示", max_rounds);
+                send_notification(
+                    "⚠️ 已达到最大轮次",
+                    &format!("已执行 {} 轮，等待人类指示", max_rounds),
+                );
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 println!("请输入新的指示（直接回车或输入 quit 退出）：");
 
@@ -584,6 +588,7 @@ impl ScreenAgentV2 {
                         if let Some(summary) = result.strip_prefix("TASK_COMPLETE: ") {
                             task_completed = true;
                             final_result = summary.to_string();
+                            send_notification("✅ 任务已完成", summary);
                         }
 
                         messages.push(json!({
@@ -811,6 +816,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
         }
         "ask_human" => {
             let question = args["question"].as_str().unwrap_or("需要你的帮助");
+            send_notification("💬 AI 需要你的帮助", question);
             println!("[工具调用] ask_human");
             println!("🙋 AI 请求人类帮助：");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -889,6 +895,19 @@ fn get_tools_definition() -> Value {
         {"type": "function", "function": {"name": "task_complete", "description": "任务完成时调用此工具", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "任务完成摘要"}}, "required": ["summary"]}}},
         {"type": "function", "function": {"name": "read_clipboard", "description": "读取系统剪贴板中的文本内容。用于查看用户或程序复制到剪贴板的文本。", "parameters": {"type": "object", "properties": {}, "required": []}}}
     ])
+}
+
+fn send_notification(title: &str, message: &str) {
+    let script = format!(
+        r#"display notification \"{}\" with title \"{}\""#,
+        message.replace('"', r#"\""#),
+        title.replace('"', r#"\""#)
+    );
+    Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok();
 }
 
 fn format_app_list_section(title: &str, apps: &[String]) -> String {
