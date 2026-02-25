@@ -1,11 +1,13 @@
 pub mod accessibility;
 pub mod ai;
 pub mod app_manager;
+pub mod config;
 pub mod display;
 pub mod document_parser;
 pub mod keyboard;
 pub mod mcp_server;
 pub mod mouse;
+pub mod image_diff;
 pub mod screen_agent;
 pub mod screen_agent_v2;
 pub mod screenshot;

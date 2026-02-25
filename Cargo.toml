@@ -3,6 +3,10 @@ name = "uicontrol"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "qcu"
+path = "src/bin/screen_agent_v2.rs"
+
 [dependencies]
 enigo = "0.6.1"
 anyhow = "1"
@@ -10,8 +14,11 @@ axum = "0.7"
 accessibility = "0.1"
 accessibility-sys = "0.1"
 base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
+dialoguer = "0.11"
+dirs = "6"
 dotenv = "0.15"
 rig-core = "0.31"
 rmcp = { version = "0.14.0", features = ["server", "transport-streamable-http-server"] }
@@ -21,6 +28,7 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"

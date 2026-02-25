@@ -5,10 +5,13 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use crate::ai::load_openai_config;
+use crate::config::AppConfig;
 use crate::display::{get_stitched_layout, StitchedLayout};
 use crate::screenshot::take_stitched_screenshot;
 
@@ -58,6 +61,9 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 5. 控制应用时优先使用快捷键（hotkey / press_key）完成操作，仅在快捷键不可用或无法确定时再使用鼠标。
 6. 需要页面滚动时，优先使用 page_down/page_up；仅在必须精确滚轮控制时使用 scroll。
 "#;
+
+const SCREEN_UNCHANGED_HINT: &str =
+    "[系统提示] 页面未发生显著变化。请基于当前屏幕继续分析并执行下一步操作。";
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
@@ -160,14 +166,14 @@ struct PendingToolCall {
     arguments: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct SessionChatLog {
     task: String,
     start_time: String,
     rounds: Vec<RoundChatLog>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct RoundChatLog {
     round: usize,
     input_text: String,
@@ -176,7 +182,7 @@ struct RoundChatLog {
     tool_calls: Vec<ToolCallLog>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ToolCallLog {
     name: String,
     arguments: Value,
@@ -187,22 +193,33 @@ pub struct ScreenAgentV2;
 
 impl ScreenAgentV2 {
     pub async fn run(task_goal: &str) -> Result<String> {
+        let app_config = AppConfig::load().context("加载应用配置失败")?;
         let config = load_openai_config()?;
         let session_timestamp = now_unix_timestamp();
         let chat_log_path = build_chat_log_path(&session_timestamp);
-        let mut session_chat_log = SessionChatLog {
+        let session_chat_log = Arc::new(Mutex::new(SessionChatLog {
             task: task_goal.to_string(),
             start_time: session_timestamp,
             rounds: Vec::new(),
-        };
+        }));
+
+        let ctrlc_log = Arc::clone(&session_chat_log);
+        let ctrlc_path = chat_log_path.clone();
+        let ctrlc_handle = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("\n⚠️ 收到 Ctrl+C 信号，正在保存聊天记录...");
+                if let Err(e) = save_chat_log_from_shared(&ctrlc_path, &ctrlc_log).await {
+                    eprintln!("❌ Ctrl+C 保存聊天记录失败: {}", e);
+                }
+                eprintln!("👋 进程已退出");
+                std::process::exit(130);
+            }
+        });
 
         let http_client = Client::new();
         let api_base = config.api_base.trim_end_matches('/');
         let api_url = format!("{}/chat/completions", api_base);
-        let max_rounds: usize = std::env::var("AGENT_MAX_ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
+        let max_rounds: usize = app_config.agent_max_rounds;
 
         let installed_apps = match crate::app_manager::list_applications() {
             Ok(apps) => apps,
@@ -245,6 +262,8 @@ impl ScreenAgentV2 {
         let mut task_completed = false;
         let mut final_result = String::new();
         let mut round: usize = 1;
+        let mut last_screenshot_base64: Option<String> = None;
+        let mut last_focused_app: Option<String> = None;
 
         loop {
             if round > max_rounds {
@@ -253,7 +272,9 @@ impl ScreenAgentV2 {
                 println!("请输入新的指示（直接回车或输入 quit 退出）：");
 
                 let mut human_input = String::new();
-                std::io::stdin().read_line(&mut human_input).unwrap_or_default();
+                std::io::stdin()
+                    .read_line(&mut human_input)
+                    .unwrap_or_default();
                 let human_input = human_input.trim();
 
                 if human_input.is_empty() || human_input == "quit" || human_input == "exit" {
@@ -277,6 +298,22 @@ impl ScreenAgentV2 {
             let (screenshot_base64, _) = take_stitched_screenshot(&layout)
                 .map_err(|e| anyhow!("多屏拼接截图失败: {}", e))?;
 
+            let mut attach_screenshot = true;
+            if let Some(last_base64) = last_screenshot_base64.as_deref() {
+                match crate::image_diff::compare_images_base64(last_base64, &screenshot_base64) {
+                    Ok(diff_percent) => {
+                        println!("🖼️ 截图差异: {:.4}% (阈值: 1.0000%)", diff_percent);
+                        if diff_percent <= 1.0 {
+                            attach_screenshot = false;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ 截图差异比对失败，回退为正常注入截图: {}", e);
+                    }
+                }
+            }
+            last_screenshot_base64 = Some(screenshot_base64.clone());
+
             let instruction = if round == 1 {
                 format!(
                     "任务目标：{}\n\n请分析当前屏幕截图，执行下一步操作。",
@@ -289,7 +326,23 @@ impl ScreenAgentV2 {
                 )
             };
 
-            let app_shortcuts_context = build_focused_app_shortcuts_context();
+            let focused_app_name = get_focused_app_name();
+            let app_shortcuts_context = match focused_app_name.as_deref() {
+                Some(app_name) => {
+                    let should_inject_shortcuts = match last_focused_app.as_deref() {
+                        None => true,
+                        Some(last_app_name) => last_app_name != app_name,
+                    };
+
+                    if should_inject_shortcuts {
+                        build_focused_app_shortcuts_context(app_name)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            last_focused_app = focused_app_name;
 
             let final_instruction = if let Some(shortcuts_context) = app_shortcuts_context {
                 format!("{}\n\n{}", instruction, shortcuts_context)
@@ -300,23 +353,40 @@ impl ScreenAgentV2 {
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!("📤 [第 {} 轮] 发送给 AI 的输入：", round);
             println!("{}", final_instruction);
-            println!("[截图已附带]");
+            if attach_screenshot {
+                println!("[截图已附带]");
+            } else {
+                println!("{}", SCREEN_UNCHANGED_HINT);
+            }
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+            let round_input_text = if attach_screenshot {
+                final_instruction.clone()
+            } else {
+                format!("{}\n\n{}", final_instruction, SCREEN_UNCHANGED_HINT)
+            };
 
             let mut round_chat_log = RoundChatLog {
                 round,
-                input_text: final_instruction.clone(),
+                input_text: round_input_text,
                 ai_thinking: String::new(),
                 ai_response: String::new(),
                 tool_calls: Vec::new(),
             };
 
+            let mut user_content = vec![json!({"type": "text", "text": final_instruction})];
+            if attach_screenshot {
+                user_content.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:image/png;base64,{}", screenshot_base64)}
+                }));
+            } else {
+                user_content.push(json!({"type": "text", "text": SCREEN_UNCHANGED_HINT}));
+            }
+
             messages.push(json!({
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": final_instruction},
-                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", screenshot_base64)}}
-                ]
+                "content": user_content
             }));
 
             loop {
@@ -498,9 +568,10 @@ impl ScreenAgentV2 {
                     }));
 
                     for (idx, tc) in tool_calls.iter().enumerate() {
-                        let result = execute_tool(&tc.function.name, &tc.function.arguments, &layout)
-                            .await
-                            .unwrap_or_else(|e| format!("工具执行失败: {}", e));
+                        let result =
+                            execute_tool(&tc.function.name, &tc.function.arguments, &layout)
+                                .await
+                                .unwrap_or_else(|e| format!("工具执行失败: {}", e));
 
                         let arguments = serde_json::from_str::<Value>(&tc.function.arguments)
                             .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
@@ -537,19 +608,23 @@ impl ScreenAgentV2 {
                 break;
             }
 
-            session_chat_log.rounds.push(round_chat_log);
+            {
+                let mut chat_log = session_chat_log.lock().await;
+                chat_log.rounds.push(round_chat_log);
+            }
 
             if task_completed {
-                save_chat_log(&chat_log_path, &session_chat_log)?;
+                ctrlc_handle.abort();
+                save_chat_log_from_shared(&chat_log_path, &session_chat_log).await?;
                 return Ok(final_result);
             }
 
-            prune_old_image_messages(&mut messages);
             tokio::time::sleep(Duration::from_secs(3)).await;
             round += 1;
         }
 
-        save_chat_log(&chat_log_path, &session_chat_log)?;
+        ctrlc_handle.abort();
+        save_chat_log_from_shared(&chat_log_path, &session_chat_log).await?;
 
         Ok(format!(
             "达到最大轮次 {}，最后结果: {}",
@@ -564,8 +639,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
 
     match name {
         "click" => {
-            let norm_x = get_f64(&args, "x")?;
-            let norm_y = get_f64(&args, "y")?;
+            let (norm_x, norm_y) = extract_coordinates(&args, "x", "y", "click")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
             println!(
                 "[工具调用] click | 输入: norm_x={}, norm_y={}",
@@ -580,8 +654,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "right_click" => {
-            let norm_x = get_f64(&args, "x")?;
-            let norm_y = get_f64(&args, "y")?;
+            let (norm_x, norm_y) = extract_coordinates(&args, "x", "y", "right_click")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
             println!(
                 "[工具调用] right_click | 输入: norm_x={}, norm_y={}",
@@ -596,8 +669,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "double_click" => {
-            let norm_x = get_f64(&args, "x")?;
-            let norm_y = get_f64(&args, "y")?;
+            let (norm_x, norm_y) = extract_coordinates(&args, "x", "y", "double_click")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
             println!(
                 "[工具调用] double_click | 输入: norm_x={}, norm_y={}",
@@ -612,8 +684,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "hover" => {
-            let norm_x = get_f64(&args, "x")?;
-            let norm_y = get_f64(&args, "y")?;
+            let (norm_x, norm_y) = extract_coordinates(&args, "x", "y", "hover")?;
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
             println!(
                 "[工具调用] hover | 输入: norm_x={}, norm_y={}",
@@ -628,8 +699,7 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "scroll" => {
-            let norm_x = get_f64(&args, "x")?;
-            let norm_y = get_f64(&args, "y")?;
+            let (norm_x, norm_y) = extract_coordinates(&args, "x", "y", "scroll")?;
             let direction = get_optional_str(&args, "direction").unwrap_or("down");
             let clicks = get_optional_i32(&args, "clicks").unwrap_or(3);
             let (gx, gy) = normalized_to_global(layout, norm_x, norm_y)?;
@@ -660,10 +730,9 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             Ok(output)
         }
         "drag" => {
-            let from_x = get_f64(&args, "from_x")?;
-            let from_y = get_f64(&args, "from_y")?;
-            let to_x = get_f64(&args, "to_x")?;
-            let to_y = get_f64(&args, "to_y")?;
+            let (from_x, from_y) =
+                extract_coordinates(&args, "from_x", "from_y", "drag(from)")?;
+            let (to_x, to_y) = extract_coordinates(&args, "to_x", "to_y", "drag(to)")?;
             let (gfx, gfy) = normalized_to_global(layout, from_x, from_y)?;
             let (gtx, gty) = normalized_to_global(layout, to_x, to_y)?;
             println!(
@@ -750,7 +819,9 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
             println!("请输入你的回复（输入完成后按回车）：");
 
             let mut human_input = String::new();
-            std::io::stdin().read_line(&mut human_input).unwrap_or_default();
+            std::io::stdin()
+                .read_line(&mut human_input)
+                .unwrap_or_default();
             let human_input = human_input.trim().to_string();
 
             let result = if human_input.is_empty() {
@@ -779,7 +850,10 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
                         println!("[工具结果] read_clipboard | {}", result);
                         Ok(result)
                     } else {
-                        println!("[工具结果] read_clipboard | 内容长度: {} 字符", content.len());
+                        println!(
+                            "[工具结果] read_clipboard | 内容长度: {} 字符",
+                            content.len()
+                        );
                         Ok(content)
                     }
                 }
@@ -835,6 +909,45 @@ fn normalized_to_global(layout: &StitchedLayout, norm_x: f64, norm_y: f64) -> Re
     layout
         .normalized_to_global(norm_x, norm_y)
         .map_err(|e| anyhow!("坐标转换失败: {}", e))
+}
+
+/// 从参数中提取坐标值，兼容数字和数组两种格式。
+///
+/// 支持以下格式：
+/// - 常规：{"x": 200, "y": 50}
+/// - 特殊：{"x": [200, 50]}（会将 x=200, y=50）
+/// - 特殊：{"y": [200, 50]}（会将 x=200, y=50）
+fn extract_coordinates(args: &Value, x_key: &str, y_key: &str, tool_name: &str) -> Result<(f64, f64)> {
+    if let Some((x, y)) = extract_coordinate_pair_from_field(args, x_key) {
+        println!(
+            "⚠️  工具 {} 的字段 {} 返回数组格式，按坐标对解析: x={}, y={}",
+            tool_name, x_key, x, y
+        );
+        return Ok((x, y));
+    }
+
+    if let Some((x, y)) = extract_coordinate_pair_from_field(args, y_key) {
+        println!(
+            "⚠️  工具 {} 的字段 {} 返回数组格式，按坐标对解析: x={}, y={}",
+            tool_name, y_key, x, y
+        );
+        return Ok((x, y));
+    }
+
+    let x = get_f64(args, x_key)?;
+    let y = get_f64(args, y_key)?;
+    Ok((x, y))
+}
+
+fn extract_coordinate_pair_from_field(args: &Value, key: &str) -> Option<(f64, f64)> {
+    let arr = args.get(key)?.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+
+    let x = arr.first()?.as_f64()?;
+    let y = arr.get(1)?.as_f64()?;
+    Some((x, y))
 }
 
 /// 从 JSON 值中提取 f64 数值，兼容单值和数组格式。
@@ -904,44 +1017,6 @@ fn get_string_array(value: &Value, key: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-fn prune_old_image_messages(messages: &mut [Value]) {
-    let mut image_user_indexes = Vec::new();
-    for (idx, msg) in messages.iter().enumerate() {
-        let is_user = msg.get("role").and_then(Value::as_str) == Some("user");
-        let has_image = msg
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .any(|item| item.get("type").and_then(Value::as_str) == Some("image_url"))
-            })
-            .unwrap_or(false);
-
-        if is_user && has_image {
-            image_user_indexes.push(idx);
-        }
-    }
-
-    if image_user_indexes.len() <= 1 {
-        return;
-    }
-
-    let keep_last = *image_user_indexes.last().unwrap_or(&0);
-    for idx in image_user_indexes {
-        if idx == keep_last {
-            continue;
-        }
-        if let Some(content) = messages
-            .get_mut(idx)
-            .and_then(|m| m.get_mut("content"))
-            .and_then(Value::as_array_mut)
-        {
-            content.retain(|item| item.get("type").and_then(Value::as_str) != Some("image_url"));
-        }
-    }
-}
-
 fn merge_stream_tool_call(pending: &mut Vec<PendingToolCall>, tc: StreamToolCall) {
     if pending.len() <= tc.index {
         pending.resize_with(tc.index + 1, PendingToolCall::default);
@@ -990,9 +1065,8 @@ fn finalize_stream_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
         .collect()
 }
 
-fn build_focused_app_shortcuts_context() -> Option<String> {
-    let app_name = get_focused_app_name()?;
-    let shortcuts = crate::shortcut::get_app_menu_shortcuts(&app_name).ok()?;
+fn build_focused_app_shortcuts_context(app_name: &str) -> Option<String> {
+    let shortcuts = crate::shortcut::get_app_menu_shortcuts(app_name).ok()?;
 
     let mut lines = Vec::new();
     lines.push(format!("当前聚焦应用: {}", app_name));
@@ -1065,4 +1139,15 @@ fn save_chat_log(path: &Path, log: &SessionChatLog) -> Result<()> {
 
     println!("💾 聊天记录已保存: {}", path.display());
     Ok(())
+}
+
+async fn save_chat_log_from_shared(
+    path: &Path,
+    shared_log: &Arc<Mutex<SessionChatLog>>,
+) -> Result<()> {
+    let snapshot = {
+        let log = shared_log.lock().await;
+        log.clone()
+    };
+    save_chat_log(path, &snapshot)
 }
