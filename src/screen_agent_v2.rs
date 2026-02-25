@@ -266,7 +266,7 @@ impl ScreenAgentV2 {
         let mut last_focused_app: Option<String> = None;
 
         loop {
-            if round > max_rounds {
+            if max_rounds > 0 && round > max_rounds {
                 println!("⏸️  已达到最大轮次 ({})，暂停等待人类指示", max_rounds);
                 send_notification(
                     "⚠️ 已达到最大轮次",
@@ -306,8 +306,8 @@ impl ScreenAgentV2 {
             if let Some(last_base64) = last_screenshot_base64.as_deref() {
                 match crate::image_diff::compare_images_base64(last_base64, &screenshot_base64) {
                     Ok(diff_percent) => {
-                        println!("🖼️ 截图差异: {:.4}% (阈值: 1.0000%)", diff_percent);
-                        if diff_percent <= 1.0 {
+                        println!("🖼️ 截图差异: {:.4}% (阈值: 0.1000%)", diff_percent);
+                        if diff_percent <= 0.1 {
                             attach_screenshot = false;
                         }
                     }
@@ -898,16 +898,11 @@ fn get_tools_definition() -> Value {
 }
 
 fn send_notification(title: &str, message: &str) {
-    let script = format!(
-        r#"display notification \"{}\" with title \"{}\""#,
-        message.replace('"', r#"\""#),
-        title.replace('"', r#"\""#)
-    );
-    Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .ok();
+    use notify_rust::Notification;
+
+    if let Err(e) = Notification::new().summary(title).body(message).show() {
+        eprintln!("⚠️ 发送系统通知失败: {}", e);
+    }
 }
 
 fn format_app_list_section(title: &str, apps: &[String]) -> String {
