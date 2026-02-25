@@ -68,8 +68,8 @@ pub fn scroll(x: i32, y: i32, direction: &str, clicks: i32) -> Result<(), String
     move_to(&mut enigo, x, y)?;
 
     let length = match direction {
-        "up" => clicks.abs(),
-        "down" => -clicks.abs(),
+        "up" => -clicks.abs(),
+        "down" => clicks.abs(),
         _ => return Err(format!("不支持的滚动方向: {}，仅支持 up/down", direction)),
     };
 

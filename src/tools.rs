@@ -2,9 +2,11 @@ use rig::completion::request::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
+use std::thread::sleep;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::display::StitchedLayout;
@@ -353,12 +355,78 @@ impl Tool for ScrollTool {
             "[工具调用] scroll | 输入: norm_x={}, norm_y={}, direction=\"{}\", clicks={}",
             args.x, args.y, args.direction, args.clicks
         );
+        crate::mouse::hover(x, y).map_err(|e| ToolError(e.to_string()))?;
+        sleep(Duration::from_millis(50));
         crate::mouse::scroll(x, y, &args.direction, args.clicks).map_err(ToolError)?;
         let output = format!(
             "已在归一化坐标 ({:.2}, {:.2}) -> 全局坐标 ({}, {}) 向 {} 滚动 {} 格",
             args.x, args.y, x, y, args.direction, args.clicks
         );
         println!("[工具结果] scroll | 输出: {}", output);
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PageDownArgs {}
+
+pub struct PageDownTool;
+
+impl Tool for PageDownTool {
+    const NAME: &'static str = "page_down";
+    type Error = ToolError;
+    type Args = PageDownArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "向下翻页（模拟空格键），适用于浏览器等应用".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!("[工具调用] page_down | 输入: (无参数)");
+        crate::keyboard::press_key("space").map_err(ToolError)?;
+        let output = "已执行向下翻页（Space）".to_string();
+        println!("[工具结果] page_down | 输出: {}", output);
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PageUpArgs {}
+
+pub struct PageUpTool;
+
+impl Tool for PageUpTool {
+    const NAME: &'static str = "page_up";
+    type Error = ToolError;
+    type Args = PageUpArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "向上翻页（模拟 Shift+空格键），适用于浏览器等应用".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!("[工具调用] page_up | 输入: (无参数)");
+        crate::keyboard::hotkey(&["shift"], "space").map_err(ToolError)?;
+        let output = "已执行向上翻页（Shift+Space）".to_string();
+        println!("[工具结果] page_up | 输出: {}", output);
         Ok(output)
     }
 }

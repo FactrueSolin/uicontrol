@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 
 use crate::ai::load_openai_config;
@@ -25,7 +27,9 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 - right_click(x, y) - 右键点击指定坐标，打开右键菜单
 - double_click(x, y) - 双击指定坐标，用于打开文件或选中文字
 - hover(x, y) - 将鼠标移到指定坐标，不点击，用于触发悬停菜单或提示
-- scroll(x, y, direction, clicks) - 在指定坐标滚动，direction 为 up/down
+- page_down() - 向下翻页（模拟 Space），适用于浏览器等页面滚动
+- page_up() - 向上翻页（模拟 Shift+Space），适用于浏览器等页面滚动
+- scroll(x, y, direction, clicks) - 在指定坐标滚动（鼠标滚轮，作为补充手段）
 - drag(from_x, from_y, to_x, to_y) - 从起点拖拽到终点
 
 ### 键盘操作
@@ -52,6 +56,7 @@ const PREAMBLE: &str = r#"你是一个 macOS 屏幕控制助手。你可以看�
 3. 操作后等待屏幕更新，观察结果再决定下一步
 4. 任务完成后必须调用 task_complete
 5. 控制应用时优先使用快捷键（hotkey / press_key）完成操作，仅在快捷键不可用或无法确定时再使用鼠标。
+6. 需要页面滚动时，优先使用 page_down/page_up；仅在必须精确滚轮控制时使用 scroll。
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -155,11 +160,42 @@ struct PendingToolCall {
     arguments: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SessionChatLog {
+    task: String,
+    start_time: String,
+    rounds: Vec<RoundChatLog>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoundChatLog {
+    round: usize,
+    input_text: String,
+    ai_thinking: String,
+    ai_response: String,
+    tool_calls: Vec<ToolCallLog>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallLog {
+    name: String,
+    arguments: Value,
+    result: String,
+}
+
 pub struct ScreenAgentV2;
 
 impl ScreenAgentV2 {
     pub async fn run(task_goal: &str) -> Result<String> {
         let config = load_openai_config()?;
+        let session_timestamp = now_unix_timestamp();
+        let chat_log_path = build_chat_log_path(&session_timestamp);
+        let mut session_chat_log = SessionChatLog {
+            task: task_goal.to_string(),
+            start_time: session_timestamp,
+            rounds: Vec::new(),
+        };
+
         let http_client = Client::new();
         let api_base = config.api_base.trim_end_matches('/');
         let api_url = format!("{}/chat/completions", api_base);
@@ -266,6 +302,14 @@ impl ScreenAgentV2 {
             println!("{}", final_instruction);
             println!("[截图已附带]");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+            let mut round_chat_log = RoundChatLog {
+                round,
+                input_text: final_instruction.clone(),
+                ai_thinking: String::new(),
+                ai_response: String::new(),
+                tool_calls: Vec::new(),
+            };
 
             messages.push(json!({
                 "role": "user",
@@ -430,6 +474,9 @@ impl ScreenAgentV2 {
                     },
                 };
 
+                round_chat_log.ai_thinking = message.reasoning_content.clone().unwrap_or_default();
+                round_chat_log.ai_response = message.content.clone().unwrap_or_default();
+
                 if let Some(tool_calls) = &message.tool_calls {
                     let assistant_content = message
                         .content
@@ -455,6 +502,14 @@ impl ScreenAgentV2 {
                             .await
                             .unwrap_or_else(|e| format!("工具执行失败: {}", e));
 
+                        let arguments = serde_json::from_str::<Value>(&tc.function.arguments)
+                            .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
+                        round_chat_log.tool_calls.push(ToolCallLog {
+                            name: tc.function.name.clone(),
+                            arguments,
+                            result: result.clone(),
+                        });
+
                         if let Some(summary) = result.strip_prefix("TASK_COMPLETE: ") {
                             task_completed = true;
                             final_result = summary.to_string();
@@ -471,10 +526,6 @@ impl ScreenAgentV2 {
                         }
                     }
 
-                    if task_completed {
-                        return Ok(final_result);
-                    }
-
                     // 每执行完一轮工具后立即回到外层循环，刷新截图。
                     break;
                 }
@@ -486,7 +537,10 @@ impl ScreenAgentV2 {
                 break;
             }
 
+            session_chat_log.rounds.push(round_chat_log);
+
             if task_completed {
+                save_chat_log(&chat_log_path, &session_chat_log)?;
                 return Ok(final_result);
             }
 
@@ -494,6 +548,8 @@ impl ScreenAgentV2 {
             tokio::time::sleep(Duration::from_secs(3)).await;
             round += 1;
         }
+
+        save_chat_log(&chat_log_path, &session_chat_log)?;
 
         Ok(format!(
             "达到最大轮次 {}，最后结果: {}",
@@ -587,6 +643,20 @@ async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result
                 norm_x, norm_y, direction, clicks
             );
             println!("[工具结果] scroll | 输出: {}", output);
+            Ok(output)
+        }
+        "page_down" => {
+            println!("[工具调用] page_down | 输入: (无参数)");
+            crate::keyboard::press_key("space").map_err(|e| anyhow!(e))?;
+            let output = "已执行向下翻页（Space）".to_string();
+            println!("[工具结果] page_down | 输出: {}", output);
+            Ok(output)
+        }
+        "page_up" => {
+            println!("[工具调用] page_up | 输入: (无参数)");
+            crate::keyboard::hotkey(&["shift"], "space").map_err(|e| anyhow!(e))?;
+            let output = "已执行向上翻页（Shift+Space）".to_string();
+            println!("[工具结果] page_up | 输出: {}", output);
             Ok(output)
         }
         "drag" => {
@@ -730,6 +800,8 @@ fn get_tools_definition() -> Value {
         {"type": "function", "function": {"name": "right_click", "description": "在屏幕指定坐标执行鼠标右键点击", "parameters": {"type": "object", "properties": {"x": {"type": "number", "description": "归一化 X 坐标 [0, 999]"}, "y": {"type": "number", "description": "归一化 Y 坐标 [0, 999]"}}, "required": ["x", "y"]}}},
         {"type": "function", "function": {"name": "double_click", "description": "在屏幕指定坐标执行鼠标双击", "parameters": {"type": "object", "properties": {"x": {"type": "number", "description": "归一化 X 坐标 [0, 999]"}, "y": {"type": "number", "description": "归一化 Y 坐标 [0, 999]"}}, "required": ["x", "y"]}}},
         {"type": "function", "function": {"name": "hover", "description": "将鼠标移动到屏幕指定坐标，不点击。用于触发悬停菜单或提示", "parameters": {"type": "object", "properties": {"x": {"type": "number", "description": "归一化 X 坐标 [0, 999]"}, "y": {"type": "number", "description": "归一化 Y 坐标 [0, 999]"}}, "required": ["x", "y"]}}},
+        {"type": "function", "function": {"name": "page_down", "description": "向下翻页（模拟空格键），适用于浏览器等应用", "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "page_up", "description": "向上翻页（模拟 Shift+空格键），适用于浏览器等应用", "parameters": {"type": "object", "properties": {}, "required": []}}},
         {"type": "function", "function": {"name": "scroll", "description": "在屏幕指定坐标执行滚轮操作", "parameters": {"type": "object", "properties": {"x": {"type": "number", "description": "归一化 X 坐标 [0, 999]"}, "y": {"type": "number", "description": "归一化 Y 坐标 [0, 999]"}, "direction": {"type": "string", "description": "滚动方向: up 或 down"}, "clicks": {"type": "integer", "description": "滚动格数，默认 3"}}, "required": ["x", "y", "direction"]}}},
         {"type": "function", "function": {"name": "drag", "description": "从起点坐标拖拽到终点坐标", "parameters": {"type": "object", "properties": {"from_x": {"type": "number", "description": "起点归一化 X 坐标 [0, 999]"}, "from_y": {"type": "number", "description": "起点归一化 Y 坐标 [0, 999]"}, "to_x": {"type": "number", "description": "终点归一化 X 坐标 [0, 999]"}, "to_y": {"type": "number", "description": "终点归一化 Y 坐标 [0, 999]"}}, "required": ["from_x", "from_y", "to_x", "to_y"]}}},
         {"type": "function", "function": {"name": "type_text", "description": "输入文本内容", "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "要输入的文本"}}, "required": ["text"]}}},
@@ -968,4 +1040,29 @@ fn format_shortcut_key(modifiers: &str, key: &str) -> String {
     } else {
         format!("{}{}", modifiers.trim(), key)
     }
+}
+
+fn now_unix_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn build_chat_log_path(timestamp: &str) -> PathBuf {
+    PathBuf::from("data").join(format!("chat_{}.json", timestamp))
+}
+
+fn save_chat_log(path: &Path, log: &SessionChatLog) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建数据目录失败: {}", parent.display()))?;
+    }
+
+    let content = serde_json::to_string_pretty(log).context("聊天记录序列化失败")?;
+    std::fs::write(path, content)
+        .with_context(|| format!("写入聊天记录文件失败: {}", path.display()))?;
+
+    println!("💾 聊天记录已保存: {}", path.display());
+    Ok(())
 }

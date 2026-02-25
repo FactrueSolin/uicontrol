@@ -92,6 +92,7 @@ pub fn focus_application(app_name: &str) -> Result<(), Box<dyn Error>> {
 
     thread::sleep(Duration::from_millis(500));
     if is_app_focused(clean_name) {
+        maximize_frontmost_window();
         return Ok(());
     }
 
@@ -106,10 +107,47 @@ pub fn focus_application(app_name: &str) -> Result<(), Box<dyn Error>> {
 
     thread::sleep(Duration::from_millis(500));
     if is_app_focused(clean_name) {
+        maximize_frontmost_window();
         return Ok(());
     }
 
     Err(format!("无法聚焦应用 '{}'，两种方式均失败", clean_name).into())
+}
+
+fn maximize_frontmost_window() {
+    let script = r#"
+tell application "Finder"
+    set desktopBounds to bounds of window of desktop
+end tell
+
+set screenWidth to item 3 of desktopBounds
+set screenHeight to item 4 of desktopBounds
+set menuBarHeight to 25
+set usableHeight to screenHeight - menuBarHeight
+
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    tell frontApp
+        if (count of windows) > 0 then
+            tell window 1
+                set position to {0, menuBarHeight}
+                set size to {screenWidth, usableHeight}
+            end tell
+        end if
+    end tell
+end tell
+"#;
+
+    match Command::new("osascript").arg("-e").arg(script).output() {
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("⚠️  最大化窗口失败（已忽略）: {}", stderr.trim());
+        }
+        Err(err) => {
+            println!("⚠️  最大化窗口失败（已忽略）: {}", err);
+        }
+        _ => {}
+    }
 }
 
 fn is_app_focused(app_name: &str) -> bool {
