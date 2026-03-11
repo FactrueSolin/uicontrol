@@ -604,6 +604,14 @@ impl ScreenAgentV2 {
                 break;
             }
 
+            let removed_images = compact_history_screenshots(messages);
+            if removed_images > 0 {
+                println!(
+                    "🧹 已精简历史上下文，移除 {} 张历史截图（仅保留文本上下文）",
+                    removed_images
+                );
+            }
+
             session.save()?;
             update_ctrlc_session_snapshot(&ctrlc_session, session);
 
@@ -666,6 +674,46 @@ fn update_ctrlc_session_snapshot(shared_session: &Arc<Mutex<Session>>, session: 
     if let Ok(mut guard) = shared_session.lock() {
         *guard = session.clone();
     }
+}
+
+/// 精简历史消息中的截图，避免上下文无限膨胀。
+///
+/// 规则：删除所有 user 消息中的 image_url / input_image，仅保留文本上下文。
+/// 返回值：本次删除的截图数量。
+fn compact_history_screenshots(messages: &mut Vec<Value>) -> usize {
+    let mut removed_images = 0usize;
+
+    for msg in messages.iter_mut() {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+
+        let Some(items) = content.as_array_mut() else {
+            continue;
+        };
+
+        let before = items.len();
+        items.retain(|item| {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            item_type != "image_url" && item_type != "input_image"
+        });
+
+        removed_images += before.saturating_sub(items.len());
+
+        if before > 0 && items.is_empty() {
+            items.push(json!({
+                "type": "text",
+                "text": "[历史截图已省略]"
+            }));
+        }
+    }
+
+    removed_images
 }
 
 async fn execute_tool(name: &str, args: &str, layout: &StitchedLayout) -> Result<String> {
